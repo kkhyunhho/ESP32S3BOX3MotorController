@@ -11,7 +11,7 @@ Current motor configuration (bridge mode):
 - 2× Z-axis motors (CAN IDs `0x01`, `0x02`)
 - 1× X-axis motor  (CAN ID `0x03`)
 - Y-axis: **planned, not yet implemented** — UI placeholder panel exists in
-  `ui.c`, but neither `motor_ctrl.h` nor `bridge.py` handles it yet.
+  `ui.c`, but neither `motor_cmd.h` nor `bridge.py` handles it yet.
 
 A touch UI built with LVGL on the 320×240 LCD captures jog input and sends
 ASCII commands (`CMD:Z+`, `CMD:X-`, `CMD:HOME`, …) over USB serial to the PC.
@@ -45,15 +45,15 @@ idf.py set-target esp32s3          # one-time after build/ is deleted
 idf.py build                        # full build
 idf.py -p COM<N> flash monitor      # flash + open serial (Ctrl+] to exit)
 idf.py monitor                      # serial monitor only
-idf.py menuconfig                   # change sdkconfig (motor IDs, jog speed)
+idf.py menuconfig                   # adjust BSP / LVGL / framework options
 idf.py fullclean                    # nuke build/ when CMake gets confused
 idf.py reconfigure                  # re-run CMake without wiping build/
 python bridge.py                    # start PC-side CAN bridge
 ```
 
-Kconfig options live under **Motor Controller** in menuconfig (see
-`main/Kconfig.projbuild`). Settings persist to `sdkconfig`, which is
-git-ignored so pin numbers / motor IDs never get committed.
+The firmware has no project-specific menuconfig options in bridge mode —
+jog speed / acceleration / direction inversion / motor port mapping all
+live at the top of [bridge.py](bridge.py) on the PC side.
 
 > `idf.py monitor` and `bridge.py` share the same COM port. Close the monitor
 > before running the bridge.
@@ -64,10 +64,9 @@ git-ignored so pin numbers / motor IDs never get committed.
 
 ```
 main/                       ESP32 firmware
-├── main.c                  app_main: BSP → motor_ctrl → UI
+├── main.c                  app_main: BSP → motor_cmd → UI
 ├── ui.c / ui.h             LVGL touch UI (Z/X quadrant dial + Y placeholder)
-├── motor_ctrl.c / .h       Button event → ASCII command on stdout (USB serial)
-├── Kconfig.projbuild       Motor CAN IDs, jog speed, direction inversion
+├── motor_cmd.c / .h        Button event → ASCII command on stdout (USB serial)
 └── idf_component.yml       esp32_s3_box_3 BSP dependency
 bridge.py                   PC-side serial→CAN bridge
 mks_motor.py                MKS SERVO57D CAN protocol wrapper (PC side)
@@ -81,9 +80,9 @@ In `app_main()` ([main/main.c](main/main.c)):
 
 1. `bsp_display_start()` — LCD + LVGL + touch input device.
 2. `bsp_display_backlight_on()` — display is dark until this is called.
-3. `motor_ctrl_init()` — currently a no-op in bridge mode (logs a banner).
+3. `motor_cmd_log_banner()` — prints a one-line startup banner (no motor I/O in bridge mode).
 4. `ui_create()` inside `bsp_display_lock(0)` / `bsp_display_unlock()` — UI
-   event callbacks call `motor_jog_start` / `motor_jog_stop`, which `printf`
+   event callbacks call `motor_cmd_jog_start` / `motor_cmd_jog_stop`, which `printf`
    ASCII commands to stdout (= USB serial).
 
 The firmware does no CAN init, no RX queue handling, and no motor handshake.
@@ -93,7 +92,7 @@ All of that lives in `mks_motor.py` on the PC side.
 
 Every `lv_*` call from outside the LVGL task **must** be guarded by
 `bsp_display_lock(timeout_ms)` / `bsp_display_unlock()`. UI event callbacks
-run on the LVGL task, so they may call `motor_jog_start` / `motor_jog_stop`
+run on the LVGL task, so they may call `motor_cmd_jog_start` / `motor_cmd_jog_stop`
 directly without locking.
 
 ### Fonts
@@ -126,8 +125,7 @@ output, etc.).
 The PC bridge owns all CAN communication. It opens one USB2CAN adapter per
 motor and drives them in parallel via Python threads. Per-axis direction
 inversion is controlled by the `Z_INVERT` / `X_INVERT` flags at the top of
-`bridge.py` (independent of the firmware-side `CONFIG_MOTOR_*_INVERT` Kconfig
-options, which are legacy / unused in bridge mode).
+`bridge.py`.
 
 ### MKS CAN protocol quick reference
 
@@ -159,10 +157,10 @@ CAN bus speed: **500 Kbps** (MKS SERVO57D factory default).
 - **Termination**: 120 Ω at each end of the CAN bus (adapter side jumper +
   resistor at the motor end). Powered-off CAN_H↔CAN_L should read ≈ 60 Ω.
 
-> The ESP32-S3 TWAI peripheral is **not** wired up in bridge mode. The
-> `CONFIG_TWAI_TX_GPIO` / `CONFIG_TWAI_RX_GPIO` options in
-> `main/Kconfig.projbuild` are unused; pins 38/39 are kept as defaults in
-> case a future direct-CAN mode is introduced.
+> The ESP32-S3 TWAI peripheral is **not** wired up in bridge mode — all
+> CAN traffic is handled by the PC. If a future direct-CAN mode is added,
+> TWAI GPIO pins and CAN IDs will need to be reintroduced (Kconfig or
+> equivalent).
 
 ### Hardware-specific sdkconfig defaults
 
@@ -176,8 +174,6 @@ without a reason:
   read-only data in PSRAM (large LVGL footprint).
 - `CONFIG_LV_FONT_MONTSERRAT_14/18` — fonts used by `ui.c`.
 - `CONFIG_FREERTOS_HZ=1000` — 1 ms tick.
-- `CONFIG_TWAI_ISR_IN_IRAM` — no-op in bridge mode (TWAI driver not loaded);
-  harmless to leave enabled.
 
 If `idf.py flash` cannot find the chip, the cable is likely power-only;
 the BOX-3 needs the USB-C **data** port.
@@ -199,14 +195,12 @@ Do **not** edit anything under `managed_components/` — regenerated from
 
 When the Y-axis motor is added, the following touchpoints must change in lock-step:
 
-- [main/motor_ctrl.h](main/motor_ctrl.h) — add `AXIS_Y` to `axis_t`.
-- [main/motor_ctrl.c](main/motor_ctrl.c) — add `case AXIS_Y` to jog/stop.
+- [main/motor_cmd.h](main/motor_cmd.h) — add `AXIS_Y` to `axis_t`.
+- [main/motor_cmd.c](main/motor_cmd.c) — add `case AXIS_Y` to jog/stop.
 - [main/ui.c](main/ui.c) — wire the existing Y placeholder buttons to
-  `motor_jog_start(AXIS_Y, …)`.
+  `motor_cmd_jog_start(AXIS_Y, …)`.
 - [bridge.py](bridge.py) — add a 4th `MKSMotor.open(port=PORT_Y)`, a `Y_INVERT`
   flag, and `Y+` / `Y-` / `Y0` handlers; update `home_all` to include Y.
-- [main/Kconfig.projbuild](main/Kconfig.projbuild) — add `CAN_ID_Y` and
-  `MOTOR_Y_INVERT` (mirroring X for consistency).
 - README and this file's motor table.
 
 ---
@@ -234,11 +228,11 @@ Third-party code under `managed_components/` is exempt.
 | Element | Style | Example |
 |---------|-------|---------|
 | Variable / parameter / local | `snake_case` | `can_id`, `jog_speed` |
-| Function | `snake_case` (`module_action`) | `motor_jog_start`, `ui_create` |
+| Function | `snake_case` (`module_action`) | `motor_cmd_jog_start`, `ui_create` |
 | Struct / typedef | `snake_case_t` | `btn_ctx_t` |
 | Enum constant | `SCREAMING_SNAKE_CASE` | `DIR_POS`, `AXIS_Z` |
 | Macro / `#define` | `SCREAMING_SNAKE_CASE` | `MKS_STATUS_OK`, `BTN_SZ` |
-| File | `snake_case.c` / `.h` | `motor_ctrl.c`, `motor_ctrl.h` |
+| File | `snake_case.c` / `.h` | `motor_cmd.c`, `motor_cmd.h` |
 | Module-internal globals | `static`, prefix `s_` | `static bool s_jogging` |
 
 Additional rules:

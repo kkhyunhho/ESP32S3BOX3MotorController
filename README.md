@@ -31,11 +31,12 @@ Run from a PowerShell session with ESP-IDF activated.
 idf.py set-target esp32s3            # one-time after build/ is deleted
 idf.py build
 idf.py -p COM<N> flash monitor       # flash + serial (Ctrl+] to exit)
-idf.py menuconfig                    # change pins / CAN IDs / jog speed
+idf.py menuconfig                    # adjust BSP / LVGL / framework options
 ```
 
-Kconfig options live under `menuconfig → Motor Controller`
-(see [main/Kconfig.projbuild](main/Kconfig.projbuild)).
+In bridge mode the firmware has no project-specific menuconfig options —
+jog speed, acceleration, motor port mapping, and direction inversion all
+live at the top of [bridge.py](bridge.py) on the PC side.
 
 ## Running the PC bridge
 
@@ -71,9 +72,33 @@ Each physical adapter should be labelled with the motor it is wired to
 
 ### Launch
 
+From a PowerShell session:
+
 ```powershell
 python bridge.py
 ```
+
+Or, for one-click launch from the desktop, double-click
+[launch_bridge.bat](launch_bridge.bat). The script `cd`s to its own folder
+and runs `python bridge.py`, so it works even from a desktop shortcut.
+
+To put it on the desktop: right-click [launch_bridge.bat](launch_bridge.bat)
+→ **Create shortcut** → drag the resulting `.lnk` to the desktop.
+
+#### Before launching (every time)
+
+- **Close `idf.py monitor`** — it holds the same COM port as the bridge.
+- **Verify USB2CAN port numbers** with
+  `python CAN2USBAdapterDeviceRecognition.py` and update `PORT_*` in
+  [bridge.py](bridge.py) if the order changed.
+- **Plug in all three USB2CAN adapters and the ESP32-S3-BOX-3** before
+  starting. Missing adapters will surface as an open-port error in the
+  console window opened by the `.bat`.
+- **First-time only:** install `pyserial` via `python -m pip install pyserial`.
+  If you see `ModuleNotFoundError: No module named 'serial'`, this is why.
+
+The `.bat` ends with `pause`, so any error message stays on screen until you
+press a key — don't close the window before reading it.
 
 Defaults (edit at the top of [bridge.py](bridge.py) if needed):
 
@@ -90,11 +115,11 @@ Defaults (edit at the top of [bridge.py](bridge.py) if needed):
 ```
 motor_controller/
 ├── main/                  ESP32 firmware sources
-│   ├── main.c             app_main: display → motor_ctrl → UI
+│   ├── main.c             app_main: display → motor_cmd → UI
 │   ├── ui.c / ui.h        LVGL touch UI
-│   ├── motor_ctrl.c / .h  Button event → ASCII command on USB serial
-│   └── Kconfig.projbuild  menuconfig entries
+│   └── motor_cmd.c / .h   Button event → ASCII command on USB serial
 ├── bridge.py              PC-side serial→CAN bridge
+├── launch_bridge.bat      Double-click launcher for bridge.py
 ├── mks_motor.py           MKS SERVO57D CAN protocol wrapper
 ├── CAN2USBAdapterDeviceRecognition.py
 │                          USB2CAN adapter port-number probe
