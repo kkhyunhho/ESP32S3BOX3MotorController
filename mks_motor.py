@@ -434,17 +434,38 @@ class MKSMotor:
             print("[ERROR] No response")
         return initial
 
-    @staticmethod
-    def move_sync(motors, moves, barrier=None):
-        """Run the same move sequence on multiple motors in sync.
+    def jog(self, speed_rpm: int, cw: bool, accel: int = 50):
+        """Start or stop continuous speed-mode jog (F6H).
 
-        All motors wait at a barrier before starting, so they
-        begin moving simultaneously regardless of thread scheduling.
+        speed_rpm=0 issues a soft stop regardless of cw.
 
         Args:
-            motors: List of MKSMotor instances to move together.
-            moves: List of argument tuples passed to move_to()
-                in order.
+            speed_rpm: Target speed in RPM (0 = stop).
+            cw: True for clockwise, False for counter-clockwise.
+            accel: Acceleration/deceleration value (0-255).
+
+        Returns:
+            Status byte from motor response.
+        """
+        speed = self._clamp(speed_rpm, 0, self._max_speed_rpm)
+        acc   = self._clamp(accel, 0, self._max_accel)
+        byte2 = (0x80 if cw else 0x00) | ((speed >> 8) & 0x0F)
+        byte3 = speed & 0xFF
+        return self._send(0xF6, byte2, byte3, acc, silent=True)
+
+    # --- Sync helpers (multi-motor) ---
+
+    @staticmethod
+    def _sync(motors, action, barrier=None):
+        """Run action(motor) on each motor in parallel, gated by a barrier.
+
+        All threads wait at the barrier before running action(),
+        so the per-motor work starts at the same instant regardless
+        of thread scheduling.
+
+        Args:
+            motors: List of MKSMotor instances.
+            action: Callable taking a single MKSMotor argument.
             barrier: Optional threading.Barrier. If None, one is
                 created internally sized to len(motors).
         """
@@ -452,10 +473,7 @@ class MKSMotor:
             barrier = threading.Barrier(len(motors))
         threads = [
             threading.Thread(
-                target=lambda m=m: (
-                    barrier.wait(),
-                    [m.move_to(*args) for args in moves],
-                )
+                target=lambda m=m: (barrier.wait(), action(m))
             )
             for m in motors
         ]
@@ -463,6 +481,51 @@ class MKSMotor:
             t.start()
         for t in threads:
             t.join()
+
+    @staticmethod
+    def move_sync(motors, moves, barrier=None):
+        """Run the same move sequence on multiple motors in sync.
+
+        Args:
+            motors: List of MKSMotor instances to move together.
+            moves: List of argument tuples passed to move_to()
+                in order.
+            barrier: Optional threading.Barrier.
+        """
+        MKSMotor._sync(
+            motors,
+            lambda m: [m.move_to(*args) for args in moves],
+            barrier,
+        )
+
+    @staticmethod
+    def jog_sync(motors, speed_rpm, cw, accel=50, barrier=None):
+        """Start or stop continuous jog on multiple motors in sync.
+
+        speed_rpm=0 issues a soft stop on every motor in the list.
+
+        Args:
+            motors: List of MKSMotor instances to jog together.
+            speed_rpm: Target speed in RPM (0 = soft stop).
+            cw: True for clockwise, False for counter-clockwise.
+            accel: Acceleration/deceleration value (0-255).
+            barrier: Optional threading.Barrier.
+        """
+        MKSMotor._sync(
+            motors,
+            lambda m: m.jog(speed_rpm, cw, accel),
+            barrier,
+        )
+
+    @staticmethod
+    def home_sync(motors, barrier=None):
+        """Run homing on multiple motors in parallel.
+
+        Args:
+            motors: List of MKSMotor instances to home together.
+            barrier: Optional threading.Barrier.
+        """
+        MKSMotor._sync(motors, lambda m: m.home(), barrier)
 
     # --- Manual command ---
 
@@ -487,25 +550,6 @@ class MKSMotor:
         return self._send(cmd, *data)
 
     # --- Motor control ---
-
-    def jog(self, speed_rpm: int, cw: bool, accel: int = 50):
-        """Start or stop continuous speed-mode jog (F6H).
-
-        speed_rpm=0 issues a soft stop regardless of cw.
-
-        Args:
-            speed_rpm: Target speed in RPM (0 = stop).
-            cw: True for clockwise, False for counter-clockwise.
-            accel: Acceleration/deceleration value (0-255).
-
-        Returns:
-            Status byte from motor response.
-        """
-        speed = self._clamp(speed_rpm, 0, self._max_speed_rpm)
-        acc   = self._clamp(accel, 0, self._max_accel)
-        byte2 = (0x80 if cw else 0x00) | ((speed >> 8) & 0x0F)
-        byte3 = speed & 0xFF
-        return self._send(0xF6, byte2, byte3, acc, silent=True)
 
     def set_zero(self):
         """Set current position as zero point.

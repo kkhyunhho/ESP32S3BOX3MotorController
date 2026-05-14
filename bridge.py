@@ -8,7 +8,6 @@
 # NOTE: idf.py monitor must be closed before running this script
 #       (both use the same COM port).
 
-import threading
 import serial
 from mks_motor import MKSMotor
 
@@ -20,27 +19,12 @@ PORT_Z_A = 0
 PORT_Z_B = 2
 PORT_X   = 1
 
-JOG_SPEED_RPM = 300   # 10~3000
+JOG_SPEED_RPM = 200   # 10~3000
 JOG_ACCEL     = 0     # 0~255
 
 Z_INVERT = False
 X_INVERT = True
 # ─────────────────────────────────────────────────────────────────────────
-
-
-def _run_parallel(motors: list, fn):
-    """Run fn(motor) on each motor simultaneously using a barrier."""
-    barrier = threading.Barrier(len(motors))
-
-    def _task(motor):
-        barrier.wait()
-        fn(motor)
-
-    threads = [threading.Thread(target=_task, args=(m,)) for m in motors]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
 
 
 def jog_start(motors: list, positive: bool, invert: bool):
@@ -52,14 +36,10 @@ def jog_start(motors: list, positive: bool, invert: bool):
         invert: True to flip the physical direction.
     """
     cw = positive ^ invert
-
-    def _jog(motor):
-        try:
-            motor.jog(JOG_SPEED_RPM, cw, JOG_ACCEL)
-        except Exception as e:
-            print(f"[WARN] jog_start failed: {e}")
-
-    _run_parallel(motors, _jog)
+    try:
+        MKSMotor.jog_sync(motors, JOG_SPEED_RPM, cw, JOG_ACCEL)
+    except Exception as e:
+        print(f"[WARN] jog_start failed: {e}")
 
 
 def jog_stop(motors: list):
@@ -68,13 +48,10 @@ def jog_stop(motors: list):
     Args:
         motors: List of MKSMotor instances to stop.
     """
-    def _stop(motor):
-        try:
-            motor.jog(0, False, JOG_ACCEL)
-        except Exception as e:
-            print(f"[WARN] jog_stop failed: {e}")
-
-    _run_parallel(motors, _stop)
+    try:
+        MKSMotor.jog_sync(motors, 0, False, JOG_ACCEL)
+    except Exception as e:
+        print(f"[WARN] jog_stop failed: {e}")
 
 
 def home_all(z_motors: list, x_motor):
@@ -85,14 +62,10 @@ def home_all(z_motors: list, x_motor):
         x_motor: X-axis MKSMotor instance.
     """
     print("Homing Z motors...")
-
-    def _home(motor):
-        try:
-            motor.home()
-        except Exception as e:
-            print(f"[WARN] Z home failed: {e}")
-
-    _run_parallel(z_motors, _home)
+    try:
+        MKSMotor.home_sync(z_motors)
+    except Exception as e:
+        print(f"[WARN] Z home failed: {e}")
     print("Z homing complete.")
 
     print("Homing X motor...")
@@ -125,7 +98,7 @@ def main():
     z = [za, zb]
     xm = x
 
-    # home_all(z, xm)
+    home_all(z, xm)
 
     handlers = {
         'Z+':   lambda: jog_start(z,   positive=True,  invert=Z_INVERT),
