@@ -67,8 +67,6 @@ main/                       ESP32 firmware
 ├── main.c                  app_main: BSP → motor_ctrl → UI
 ├── ui.c / ui.h             LVGL touch UI (Z/X quadrant dial + Y placeholder)
 ├── motor_ctrl.c / .h       Button event → ASCII command on stdout (USB serial)
-├── can_motor.c / .h        Legacy TWAI driver layer — not called in bridge mode;
-│                           retained for future direct-CAN migration
 ├── Kconfig.projbuild       Motor CAN IDs, jog speed, direction inversion
 └── idf_component.yml       esp32_s3_box_3 BSP dependency
 bridge.py                   PC-side serial→CAN bridge
@@ -88,7 +86,7 @@ In `app_main()` ([main/main.c](main/main.c)):
    event callbacks call `motor_jog_start` / `motor_jog_stop`, which `printf`
    ASCII commands to stdout (= USB serial).
 
-There is no CAN init, no `rx_drain_task`, and no motor handshake in firmware.
+The firmware does no CAN init, no RX queue handling, and no motor handshake.
 All of that lives in `mks_motor.py` on the PC side.
 
 ### LVGL threading rule
@@ -163,8 +161,8 @@ CAN bus speed: **500 Kbps** (MKS SERVO57D factory default).
 
 > The ESP32-S3 TWAI peripheral is **not** wired up in bridge mode. The
 > `CONFIG_TWAI_TX_GPIO` / `CONFIG_TWAI_RX_GPIO` options in
-> `main/Kconfig.projbuild` are only meaningful if/when direct-CAN mode is
-> revived. Pins 38/39 are still the planned defaults.
+> `main/Kconfig.projbuild` are unused; pins 38/39 are kept as defaults in
+> case a future direct-CAN mode is introduced.
 
 ### Hardware-specific sdkconfig defaults
 
@@ -178,8 +176,8 @@ without a reason:
   read-only data in PSRAM (large LVGL footprint).
 - `CONFIG_LV_FONT_MONTSERRAT_14/18` — fonts used by `ui.c`.
 - `CONFIG_FREERTOS_HZ=1000` — 1 ms tick.
-- `CONFIG_TWAI_ISR_IN_IRAM` — currently a no-op (TWAI driver not loaded);
-  harmless, kept for the eventual direct-CAN mode.
+- `CONFIG_TWAI_ISR_IN_IRAM` — no-op in bridge mode (TWAI driver not loaded);
+  harmless to leave enabled.
 
 If `idf.py flash` cannot find the chip, the cable is likely power-only;
 the BOX-3 needs the USB-C **data** port.
@@ -355,9 +353,9 @@ For every non-trivial task:
 
 Known traps in this project:
 - `bsp_display_lock(0)` — `0` means "wait indefinitely", not "non-blocking".
-- ESP32 firmware does **not** speak CAN in bridge mode; any change that
-  reintroduces CAN should also remove the "legacy" notes around
-  `main/can_motor.c` and update the architecture diagram.
+- ESP32 firmware does **not** speak CAN in bridge mode. If a future change
+  reintroduces direct-CAN on the ESP32, update the architecture diagram and
+  the "ESP32 firmware does not speak CAN" notes throughout this file.
 - `bridge.py` and `idf.py monitor` cannot both hold the same COM port. Always
   close the monitor before starting the bridge.
 - Y axis is reserved but not implemented. Don't add `CMD:Y*` handling on one

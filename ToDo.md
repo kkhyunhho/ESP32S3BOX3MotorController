@@ -50,3 +50,14 @@
 - [x] 한국어 본문을 영어로 전면 재작성 (구조/내용은 유지)
 
 > README는 영어로 유지. ToDo.md / 대화는 계속 한국어.
+
+## 2026-05-14 | GitHub 레포 생성 및 legacy can_motor 정리
+- [x] `git init` + 초기 커밋 (bridge 모드 현재 상태)
+- [x] public GitHub 레포 `ESP32S3BOX3MotorController` 생성 (계정: kkhyunhho)
+- [x] 초기 푸시 완료
+- [x] `main/can_motor.c` / `main/can_motor.h` 삭제 (`git rm`)
+- [x] CLAUDE.md에서 `can_motor` 관련 legacy 언급 정리
+- [x] README.md 폴더 구조 표 / legacy 노트 정리
+
+> 레포 URL: https://github.com/kkhyunhho/ESP32S3BOX3MotorController
+> 폴더명 ESP32S3BOX3MotorController 로 변경은 별도 작업.

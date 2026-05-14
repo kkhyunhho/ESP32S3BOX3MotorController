@@ -23,9 +23,6 @@ script drives the motors over CAN through USB2CAN adapters.
   Reads serial lines and sends CAN frames to each motor through its
   dedicated USB2CAN adapter.
 
-> Note: `main/can_motor.c` is a leftover from an earlier direct-CAN design
-> and is not called in the current build.
-
 ## Build / Flash
 
 Run from a PowerShell session with ESP-IDF activated.
@@ -96,7 +93,6 @@ motor_controller/
 │   ├── main.c             app_main: display → motor_ctrl → UI
 │   ├── ui.c / ui.h        LVGL touch UI
 │   ├── motor_ctrl.c / .h  Button event → ASCII command on USB serial
-│   ├── can_motor.c / .h   (legacy, not built into the control flow)
 │   └── Kconfig.projbuild  menuconfig entries
 ├── bridge.py              PC-side serial→CAN bridge
 ├── mks_motor.py           MKS SERVO57D CAN protocol wrapper
