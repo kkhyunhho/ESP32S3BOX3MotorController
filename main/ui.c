@@ -1,5 +1,5 @@
 #include "ui.h"
-#include "motor_ctrl.h"
+#include "motor_cmd.h"
 #include "lvgl.h"
 
 /* ── Display dimensions ─────────────────────────────────────────────── */
@@ -50,13 +50,6 @@ static void draw_sector(lv_layer_t *layer,
     dsc.color      = lv_color_hex(colour);
     dsc.opa        = LV_OPA_COVER;
     lv_draw_arc(layer, &dsc);
-}
-
-/* ── Home button callback ───────────────────────────────────────────── */
-static void home_event_cb(lv_event_t *e)
-{
-    (void)e;
-    motor_home();
 }
 
 /* ── Custom draw: 4 arc sectors + diagonal dividers ─────────────────── */
@@ -146,14 +139,25 @@ static void dial_event_cb(lv_event_t *e)
         s_active_dir  = dir;
         s_jogging     = true;
         lv_obj_invalidate(obj);
-        motor_jog_start(axis, dir);
+        motor_cmd_jog_start(axis, dir);
     } else if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
+        /* s_jogging guards against sending a stop command when no jog
+         * was actually started — LVGL can fire RELEASED / PRESS_LOST
+         * without a preceding PRESSED if the touch starts outside the
+         * widget and drifts in, or after a programmatic state change. */
         if (s_jogging) {
-            motor_jog_stop(s_active_axis);
+            motor_cmd_jog_stop(s_active_axis);
             s_jogging = false;
             lv_obj_invalidate(obj);
         }
     }
+}
+
+/* ── Home button callback ───────────────────────────────────────────── */
+static void home_event_cb(lv_event_t *e)
+{
+    (void)e;
+    motor_cmd_home();
 }
 
 /* ── Build the dial button ──────────────────────────────────────────── */

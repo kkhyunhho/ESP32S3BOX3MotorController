@@ -1,5 +1,5 @@
 #include "bsp/esp-bsp.h"
-#include "motor_ctrl.h"
+#include "motor_cmd.h"
 #include "ui.h"
 #include "esp_log.h"
 
@@ -12,8 +12,9 @@ void app_main(void)
     bsp_display_start();
     bsp_display_backlight_on();
 
-    motor_ctrl_init();
+    motor_cmd_log_banner();
 
+    /* 0 = wait indefinitely (timeout argument, NOT non-blocking). */
     bsp_display_lock(0);
     ui_create();
     bsp_display_unlock();

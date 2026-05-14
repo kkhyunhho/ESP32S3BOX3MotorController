@@ -1,16 +1,19 @@
-#include "motor_ctrl.h"
+#include "motor_cmd.h"
 #include "esp_log.h"
 #include <stdio.h>
 
 #define TAG "MOTOR"
 
-esp_err_t motor_ctrl_init(void)
+/* fflush(stdout) after every printf forces the command out to the USB
+ * serial port immediately. Without it, line buffering can delay the
+ * byte stream and make jog buttons feel laggy. */
+
+void motor_cmd_log_banner(void)
 {
     ESP_LOGI(TAG, "Bridge mode: motor commands sent via USB serial to PC");
-    return ESP_OK;
 }
 
-void motor_jog_start(axis_t axis, dir_t dir)
+void motor_cmd_jog_start(axis_t axis, dir_t dir)
 {
     switch (axis) {
     case AXIS_Z:
@@ -23,7 +26,7 @@ void motor_jog_start(axis_t axis, dir_t dir)
     fflush(stdout);
 }
 
-void motor_jog_stop(axis_t axis)
+void motor_cmd_jog_stop(axis_t axis)
 {
     switch (axis) {
     case AXIS_Z:
@@ -36,7 +39,7 @@ void motor_jog_stop(axis_t axis)
     fflush(stdout);
 }
 
-void motor_home(void)
+void motor_cmd_home(void)
 {
     printf("CMD:HOME\n");
     fflush(stdout);
