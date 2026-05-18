@@ -5,9 +5,14 @@
     "board/esp32s3-builtin.cfg"
   ],
   "idf.portWin": "COM6",
-  "idf.currentSetup": "C:\\Espressif\\tools\\v6.0.1\\esp-idf",
+  "idf.port": "/dev/ttyACM0",
+  "idf.currentSetup": "/root/.espressif/v6.0.1/esp-idf",
+  "idf.espIdfPath": "/root/.espressif/v6.0.1/esp-idf",
+  "idf.toolsPath": "/root/.espressif",
+  "idf.pythonInstallPath": "/root/.espressif/tools/python/v6.0.1/venv/bin/python",
+  "idf.gitPath": "/usr/bin/git",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32s3"
   },
-  "idf.flashType": "DFU"
+  "idf.flashType": "UART"
 }
