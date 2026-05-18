@@ -98,7 +98,7 @@ def main():
     z = [za, zb]
     xm = x
 
-    # home_all(z, xm)
+    home_all(z, xm)
 
     handlers = {
         'Z+':   lambda: jog_start(z,   positive=True,  invert=Z_INVERT),
