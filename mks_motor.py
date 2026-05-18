@@ -16,7 +16,7 @@
 import threading
 import time
 
-import ftd2xx as ftdi
+from pyftdi.ftdi import Ftdi
 
 
 class MKSMotor:
@@ -33,15 +33,15 @@ class MKSMotor:
     _max_wait_sec = 250
 
     # FTDI device setup (USB2CAN-FIFO adapter)
+    _ftdi_vid = 0x0403
+    _ftdi_pid = 0x6001
     _ftdi_bitmode_mask = 0xFF
-    _ftdi_bitmode_async = 0x40
-    _ftdi_read_timeout_ms = 100
-    _ftdi_write_timeout_ms = 100
-    _ftdi_purge_rx_tx = 1 | 2
+    _ftdi_bitmode_value = 0x40  # SYNC_FIFO mode byte (matches original ftd2xx value)
+    _ftdi_latency_ms = 2        # tight latency for fast CAN response polling
 
     # CAN response read retry policy
-    _response_retry_count = 5
-    _response_retry_delay_s = 0.05
+    _response_retry_count = 10
+    _response_retry_delay_s = 0.1
 
     # Limit-stop recovery: the MKS firmware ignores the
     # first motion command after a limit stop, so a tiny
@@ -82,18 +82,19 @@ class MKSMotor:
         Returns:
             Configured MKSMotor instance.
         """
-        dev = ftdi.open(port)
-        dev.setBitMode(cls._ftdi_bitmode_mask, cls._ftdi_bitmode_async)
-        dev.setTimeouts(cls._ftdi_read_timeout_ms, cls._ftdi_write_timeout_ms)
-        dev.purge(cls._ftdi_purge_rx_tx)
-        time.sleep(0.1)
+        dev = Ftdi()
+        dev.open(cls._ftdi_vid, cls._ftdi_pid, index=port)
+        dev.set_bitmode(cls._ftdi_bitmode_mask, Ftdi.BitMode(cls._ftdi_bitmode_value))
+        dev.set_latency_timer(cls._ftdi_latency_ms)
+        dev.purge_buffers()
+        time.sleep(0.3)
         return cls(dev, can_id)
 
     def close(self):
         """Close the underlying FTDI device."""
         if self.dev:
             self.dev.close()
-            print("\nDevice closed.")
+            print("Device closed.")
 
     # --- Internal helpers ---
 
@@ -244,8 +245,8 @@ class MKSMotor:
         packet[16] = sum(packet[1:16]) & 0xFF  # Checksum
         packet[17] = 0x03  # ETX
 
-        self.dev.purge(1)
-        self.dev.write(bytes(packet))
+        self.dev.purge_rx_buffer()
+        self.dev.write_data(bytes(packet))
         if not silent:
             data_hex = bytes(data_bytes).hex().upper() or "(no data)"
             print(f"[TX] 0x{cmd:02X} {data_hex}")
@@ -258,10 +259,10 @@ class MKSMotor:
         resp = b""
         for _ in range(self._response_retry_count):
             time.sleep(self._response_retry_delay_s)
-            resp = self.dev.read(18)
+            resp = self.dev.read_data_bytes(18)
             if len(resp) == 18:
                 break
-            self.dev.purge(1)
+            self.dev.purge_rx_buffer()
 
         if len(resp) != 18:
             raise ConnectionError(
@@ -297,7 +298,7 @@ class MKSMotor:
         deadline = time.time() + self._max_wait_sec
 
         while time.time() < deadline:
-            resp = self.dev.read(18)
+            resp = self.dev.read_data_bytes(18)
             if len(resp) == 18:
                 status = resp[9]
                 label = self._motion_status.get(status, f"0x{status:02X}")
@@ -309,7 +310,7 @@ class MKSMotor:
                 if status == 0x03:
                     print("[LIMIT] Motor stopped by limit switch")
                     time.sleep(self._limit_recover_delay_s)
-                    self.dev.purge(1)
+                    self.dev.purge_rx_buffer()
                     coord = int(
                         self._dummy_move_offset_mm
                         / self._mm_per_turn
@@ -322,7 +323,7 @@ class MKSMotor:
                     )
                     self._send(0xF4, *dummy, silent=True)
                     time.sleep(self._limit_recover_delay_s)
-                    self.dev.purge(1)
+                    self.dev.purge_rx_buffer()
                 return status
 
             time.sleep(0.1)
@@ -346,8 +347,18 @@ class MKSMotor:
             (0x8C, [0x01, 0x01]),
         ]
         ok = True
+        # Retry each command up to 3 times: MKS firmware occasionally
+        # drops the first command after a fresh CAN connection.
         for cmd, data in commands:
-            if self._send(cmd, *data, silent=True) != 0x01:
+            success = False
+            for _ in range(3):
+                try:
+                    if self._send(cmd, *data, silent=True) == 0x01:
+                        success = True
+                        break
+                except ConnectionError:
+                    pass
+            if not success:
                 ok = False
 
         if ok:
@@ -394,7 +405,7 @@ class MKSMotor:
             )
             self._send(0xF5, *dummy, silent=True)
             time.sleep(self._limit_recover_delay_s)
-            self.dev.purge(1)
+            self.dev.purge_rx_buffer()
         elif status == 0x00:
             print("Homing FAILED. Check switch wiring.")
         else:
