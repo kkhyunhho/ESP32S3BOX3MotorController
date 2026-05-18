@@ -1,63 +1,64 @@
 # ToDo
 
-작업 단위 추적 파일. **append-only** — 과거 항목은 삭제하지 않고
-체크박스만 갱신한 뒤 한 줄 요약을 덧붙인다.
+Task tracking file. **Append-only** — past entries are never deleted; only
+their checkboxes are flipped and a one-line summary is appended.
 
-형식:
+Format:
 
 ```markdown
-## YYYY-MM-DD | 작업 제목
-- [ ] 서브태스크 1
-- [ ] 서브태스크 2
-> 완료 후 한 줄 요약
+## YYYY-MM-DD | Task title
+- [ ] Subtask 1
+- [ ] Subtask 2
+> One-line summary after completion
 ```
 
 ---
 
-## 2026-05-14 | 프로젝트 정리 (불필요 파일 제거 / README 재작성)
-- [x] `pytest_hello_world.py` 삭제 (hello_world 템플릿 잔재)
-- [x] `sdkconfig.ci` 삭제 (0 바이트 CI 설정 잔재)
-- [x] `sdkconfig.old` 삭제 (menuconfig 자동 백업)
-- [x] `__pycache__/` 삭제 (Python 바이트코드 캐시)
-- [x] `README.md` 재작성 — bridge 모드 아키텍처 반영
-- [x] `ToDo.md` 생성
+## 2026-05-14 | Project cleanup (remove dead files / rewrite README)
+- [x] Delete `pytest_hello_world.py` (leftover from hello_world template)
+- [x] Delete `sdkconfig.ci` (zero-byte CI config leftover)
+- [x] Delete `sdkconfig.old` (menuconfig auto-backup)
+- [x] Delete `__pycache__/` (Python bytecode cache)
+- [x] Rewrite `README.md` to reflect bridge-mode architecture
+- [x] Create `ToDo.md`
 
-> 정리 완료. 다음 작업부터 이 파일에 항목을 누적해 나간다.
+> Cleanup complete. From now on we accumulate entries in this file.
 
-## 2026-05-14 | CLAUDE.md 갱신 (bridge 모드 / Y축 예정 반영)
-- [x] Project 섹션 — 모터 4개(CAN) → 모터 3개(시리얼 브리지), Y축은 planned 명시
-- [x] System architecture 다이어그램 추가
-- [x] File layout — `bridge.py` / `mks_motor.py` 추가, `can_motor.c`는 legacy 명시
-- [x] Initialization order — CAN 초기화 / rx_drain_task 제거
-- [x] Serial command protocol 표 추가
-- [x] MKS CAN protocol 섹션을 PC 측(`mks_motor.py`) 기준으로 재배치
-- [x] Hardware 섹션 — ESP32 측 CAN 배선/트랜시버 설명 제거, 종단 저항만 유지
-- [x] Python 코드 컨벤션 섹션 추가
-- [x] "Planned: Y-axis addition" 체크리스트 추가 (양쪽 동시 변경 가이드)
-- [x] Known traps — CAN 관련 항목 정리, 브리지/Y축 트랩 추가
+## 2026-05-14 | Refresh CLAUDE.md (bridge mode / planned Y-axis)
+- [x] Project section — 4 CAN motors -> 3 motors via serial bridge, Y noted as planned
+- [x] Add system architecture diagram
+- [x] File layout — add `bridge.py` / `mks_motor.py`, flag `can_motor.c` as legacy
+- [x] Initialization order — drop CAN init / rx_drain_task
+- [x] Add serial command protocol table
+- [x] Reposition MKS CAN protocol section so it's PC-side (`mks_motor.py`) centric
+- [x] Hardware section — drop ESP32-side CAN wiring/transceiver text, keep termination only
+- [x] Add Python coding-convention section
+- [x] Add "Planned: Y-axis addition" checklist (covers both sides in lockstep)
+- [x] Known traps — clean up CAN-related items, add bridge/Y-axis traps
 
-> Y축 추가 시 변경 지점 5곳을 CLAUDE.md "Planned" 섹션에 박제. 다음 작업부터 그 체크리스트대로 진행.
+> Pinned the 5 touch points required for the Y-axis addition under the
+> "Planned" section in CLAUDE.md. Future Y work follows that checklist.
 
-## 2026-05-14 | README.md에 USB2CAN 포트 확인 절차 추가
-- [x] "PC 브리지 실행" 섹션에 `CAN2USBAdapterDeviceRecognition.py` 실행 절차 추가
-- [x] 포트 번호 매번 바뀔 수 있다는 경고 명시
-- [x] 폴더 구조 표에 해당 스크립트 포함
-- [x] 트러블슈팅에 "엉뚱한 축이 움직임" 케이스 추가
+## 2026-05-14 | Add USB2CAN port-check procedure to README.md
+- [x] Document running `CAN2USBAdapterDeviceRecognition.py` in the "Running the PC bridge" section
+- [x] Call out the warning that port numbers may shift between runs
+- [x] Add the helper script to the folder-layout table
+- [x] Add the "wrong axis moves" case to troubleshooting
 
-> 브리지 실행 전 포트 매핑 확인을 필수 절차로 못박음.
+> Port-mapping verification is now a hard prerequisite before launching the bridge.
 
-## 2026-05-14 | README.md 전체 영문화
-- [x] 한국어 본문을 영어로 전면 재작성 (구조/내용은 유지)
+## 2026-05-14 | Translate README.md fully into English
+- [x] Rewrite the Korean body in English (structure / content preserved)
 
-> README는 영어로 유지. ToDo.md / 대화는 계속 한국어.
+> README stays English. ToDo.md and dialog continue in Korean.
 
-## 2026-05-14 | GitHub 레포 생성 및 legacy can_motor 정리
-- [x] `git init` + 초기 커밋 (bridge 모드 현재 상태)
-- [x] public GitHub 레포 `ESP32S3BOX3MotorController` 생성 (계정: kkhyunhho)
-- [x] 초기 푸시 완료
-- [x] `main/can_motor.c` / `main/can_motor.h` 삭제 (`git rm`)
-- [x] CLAUDE.md에서 `can_motor` 관련 legacy 언급 정리
-- [x] README.md 폴더 구조 표 / legacy 노트 정리
+## 2026-05-14 | Create the GitHub repo and clean up legacy can_motor
+- [x] `git init` + initial commit (current bridge-mode state)
+- [x] Create public GitHub repo `ESP32S3BOX3MotorController` (account: kkhyunhho)
+- [x] Initial push complete
+- [x] Delete `main/can_motor.c` / `main/can_motor.h` (`git rm`)
+- [x] Clean up legacy `can_motor` references in CLAUDE.md
+- [x] Tidy folder-layout table and legacy notes in README.md
 
-> 레포 URL: https://github.com/kkhyunhho/ESP32S3BOX3MotorController
-> 폴더명 ESP32S3BOX3MotorController 로 변경은 별도 작업.
+> Repo URL: https://github.com/kkhyunhho/ESP32S3BOX3MotorController
+> Renaming the folder to ESP32S3BOX3MotorController is a separate task.
