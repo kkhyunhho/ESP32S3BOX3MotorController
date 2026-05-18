@@ -12,12 +12,12 @@ import serial
 from mks_motor import MKSMotor
 
 # ── Configuration ─────────────────────────────────────────────────────────
-ESP32_PORT = 'COM6'
+ESP32_PORT = '/dev/ttyACM0'
 ESP32_BAUD = 115200
 
-PORT_Z_A = 0
-PORT_Z_B = 2
-PORT_X   = 1
+PORT_Z_A = 1
+PORT_Z_B = 0
+PORT_X   = 2
 
 JOG_SPEED_RPM = 200   # 10~3000
 JOG_ACCEL     = 0     # 0~255
@@ -98,7 +98,7 @@ def main():
     z = [za, zb]
     xm = x
 
-    home_all(z, xm)
+    # home_all(z, xm)
 
     handlers = {
         'Z+':   lambda: jog_start(z,   positive=True,  invert=Z_INVERT),
