@@ -11,9 +11,24 @@ set -e
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
-# Install Python deps if missing (container recreation wipes pip state)
-python3 -c "import serial" 2>/dev/null || pip install --quiet pyserial
-python3 -c "import pyftdi" 2>/dev/null || pip install --quiet pyftdi
+# Ensure an isolated Python env is active. If neither conda nor venv is
+# active, create and activate a project-local .venv so pip installs don't
+# hit PEP 668 on the system Python (Ubuntu 23.04+).
+if [[ -z "${CONDA_PREFIX:-}" && -z "${VIRTUAL_ENV:-}" ]]; then
+    if [[ ! -d .venv ]]; then
+        echo "No active Python env; creating ./.venv ..."
+        python3 -m venv .venv
+    fi
+    # shellcheck disable=SC1091
+    source .venv/bin/activate
+    echo "activated $(python3 -c 'import sys; print(sys.prefix)')"
+fi
+
+# Install Python deps if missing (container recreation wipes pip state).
+# Use `python3 -m pip` so the install always targets the active python's
+# site-packages instead of a stray system pip.
+python3 -c "import serial" 2>/dev/null || python3 -m pip install --quiet pyserial
+python3 -c "import pyftdi" 2>/dev/null || python3 -m pip install --quiet pyftdi
 
 # Refresh FTDI device nodes from sysfs (fixes stale /dev after USB replug)
 python3 << 'PY'
