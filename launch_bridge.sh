@@ -11,12 +11,16 @@ set -e
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
-# Ensure an isolated Python env is active. If neither conda nor venv is
-# active, create and activate a project-local .venv so pip installs don't
-# hit PEP 668 on the system Python (Ubuntu 23.04+).
-if [[ -z "${CONDA_PREFIX:-}" && -z "${VIRTUAL_ENV:-}" ]]; then
+# Ensure the Python on PATH is in an isolated env. A conda env that was
+# created without python (e.g. `conda create -n foo` with no version)
+# leaves python3 pointing at the PEP 668-managed system Python on Ubuntu
+# 23.04+, even though CONDA_PREFIX is set. Detect that and fall back to
+# a project-local .venv that we own.
+is_isolated=$(python3 -c 'import sys; print(sys.prefix != sys.base_prefix)' 2>/dev/null || echo "False")
+if [[ "$is_isolated" != "True" ]]; then
+    echo "Active python is not isolated ($(python3 -c 'import sys; print(sys.prefix)'))."
     if [[ ! -d .venv ]]; then
-        echo "No active Python env; creating ./.venv ..."
+        echo "Creating project-local ./.venv ..."
         python3 -m venv .venv
     fi
     # shellcheck disable=SC1091
