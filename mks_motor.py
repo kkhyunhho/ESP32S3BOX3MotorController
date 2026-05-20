@@ -44,10 +44,13 @@ class MKSMotor:
     _response_retry_delay_s = 0.1
 
     # Limit-stop recovery: the MKS firmware ignores the
-    # first motion command after a limit stop, so a tiny
-    # dummy move is issued to consume that skip.
+    # first motion command after a limit stop. We follow up with
+    # a small relative move to consume that skip and physically
+    # release the limit switch (sensor hysteresis means a 0.01mm
+    # twitch isn't enough — motor barely registers it). 1mm at
+    # 300 RPM takes ~20ms, visible but quick.
     _limit_recover_delay_s = 0.5
-    _dummy_move_offset_mm = 0.01
+    _dummy_move_offset_mm = 1.0
     _dummy_move_speed_rpm = 300
 
     _motion_cmds = {0x91, 0xF4, 0xF5, 0xF6, 0xFD, 0xFE}
@@ -485,10 +488,49 @@ class MKSMotor:
             print("[ERROR] No response")
         return initial
 
+    def read_io_status(self):
+        """Read IO port status (0x34).
+
+        Returns:
+            Bit-packed byte with:
+              bit0 = IN_1 (home / left-limit)
+              bit1 = IN_2 (right-limit)
+              bit2 = OUT_1
+              bit3 = OUT_2
+            Or None if no response.
+
+            With our setup (homeTrig=0, "active low"), a bit value
+            of 0 means the corresponding switch is closed.
+        """
+        return self._send(0x34, silent=True)
+
+    def _is_at_limit(self):
+        """True if either limit switch is currently closed.
+
+        Used to decide whether the jog "first command dropped after
+        a limit stop" workaround is needed.
+        """
+        status = self.read_io_status()
+        if status is None:
+            return False
+        # bit0 = IN_1, bit1 = IN_2. Active low (0 = closed).
+        return (status & 0x01) == 0 or (status & 0x02) == 0
+
     def jog(self, speed_rpm: int, cw: bool, accel: int = 50):
         """Start or stop continuous speed-mode jog (F6H).
 
         speed_rpm=0 issues a soft stop regardless of cw.
+
+        Empirical MKS firmware quirk: when a limit switch is currently
+        closed, the first F6 motion command issued in any direction is
+        silently dropped — only the second consecutive F6 is honored.
+        Neither status code nor an intermediate F4/stop reliably
+        substitutes for that second F6.
+
+        To avoid burning a CAN round-trip on every jog, we first query
+        the IO port (0x34): only if a limit is closed do we pre-send
+        a dummy F6 to absorb the dropped slot. Normal jogs (no limit
+        active) issue a single F6 like before.
 
         Args:
             speed_rpm: Target speed in RPM (0 = stop).
@@ -496,12 +538,15 @@ class MKSMotor:
             accel: Acceleration/deceleration value (0-255).
 
         Returns:
-            Status byte from motor response.
+            Status byte from the (final) F6.
         """
         speed = self._clamp(speed_rpm, 0, self._max_speed_rpm)
         acc   = self._clamp(accel, 0, self._max_accel)
         byte2 = (0x80 if cw else 0x00) | ((speed >> 8) & 0x0F)
         byte3 = speed & 0xFF
+        if speed > 0 and self._is_at_limit():
+            # Burn the dropped-slot F6 so the real one below takes hold.
+            self._send(0xF6, byte2, byte3, acc, silent=True)
         return self._send(0xF6, byte2, byte3, acc, silent=True)
 
     # --- Sync helpers (multi-motor) ---
