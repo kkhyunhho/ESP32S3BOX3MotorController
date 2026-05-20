@@ -10,10 +10,14 @@ script drives the motors over CAN through USB2CAN adapters.
 ┌──────────────────────┐   USB    ┌──────────────────────┐  USB2CAN  ┌──────────────┐
 │  ESP32-S3-BOX-3      │ Serial   │  PC                  │ Adapter   │  MKS SERVO57D│
 │                      │ 115200   │                      │  ×3       │              │
-│  • LVGL touch UI     │ ───────► │  bridge.py           │ ────────► │  Z_A (port0) │
-│  • Button events     │          │  ├─ mks_motor.py     │           │  Z_B (port1) │
-│  • CMD:Z+/Z-/X+/...  │          │  └─ Serial reader    │           │  X   (port2) │
+│  • LVGL touch UI     │ ───────► │  bridge.py           │ ────────► │  Z_A         │
+│  • Button events     │          │  ├─ mks_motor.py     │           │  Z_B         │
+│  • CMD:Z+/Z-/X+/...  │          │  └─ Serial reader    │           │  X (SERIAL_X)│
 └──────────────────────┘          └──────────────────────┘           └──────────────┘
+
+The bridge picks adapters by FTDI chip serial — only X needs an explicit
+serial (`SERIAL_X` in [bridge.py](bridge.py)); the two Z adapters drive
+paired motors and are assigned automatically from whatever's left.
 ```
 
 - **ESP32 firmware** ([main/](main/)): Handles display output and touch
@@ -80,13 +84,16 @@ live at the top of [bridge.py](bridge.py) on the PC side.
 > The bridge shares the COM port with `idf.py monitor`. Close the monitor
 > before launching the bridge.
 
-### ⚠️ Required first: verify USB2CAN adapter port numbers
+### First-time setup: identify the X adapter serial
 
 USB2CAN adapter (FTDI FT232R family, VID:PID `0403:6001`) enumeration order
 **changes between runs** depending on plug order and which USB hub they sit
-behind. Sending commands to the wrong port can move the wrong axis or
-cause a crash, so **always** check the current port mapping before starting
-`bridge.py`.
+behind. To survive that, the bridge picks adapters by **FTDI chip serial
+number**, not by enumeration index — so once you record the X adapter's
+serial in `SERIAL_X`, the mapping is stable across reboots.
+
+To find which serial belongs to the X adapter (one-time per hardware
+swap), disconnect everything except the X adapter and run:
 
 **Windows** (D2XX-based):
 ```powershell
@@ -104,18 +111,16 @@ for i,(u,_) in enumerate(Ftdi.list_devices()):
 "
 ```
 
-Example output:
+With only the X adapter plugged in you should see exactly one entry, e.g.:
 
 ```
-index=0  serial=A10PUO5V
-index=1  serial=NTAM63XD
-index=2  serial=A10PUO5W
+index=0  serial=NTAM63XD
 ```
 
-Each physical adapter should be labelled with the motor it is wired to
-(Z_A / Z_B / X). Confirm that the indices above match the
-`PORT_Z_A` / `PORT_Z_B` / `PORT_X` values at the top of
-[bridge.py](bridge.py), and update them if the physical order changed.
+Set `SERIAL_X` in [bridge.py](bridge.py) to that string. Z adapters don't
+need to be identified — `bridge.py` opens whichever two FTDI adapters
+remain and uses them as the paired Z motors. If you ever physically
+relabel the X adapter, repeat this step.
 
 ### Launch
 
@@ -140,17 +145,19 @@ To put it on the desktop: right-click [launch_bridge.bat](launch_bridge.bat)
 
 [launch_bridge.sh](launch_bridge.sh) handles the Linux-specific chores
 automatically on every run:
-1. Installs `pyserial` / `pyftdi` if missing (container recreation wipes
-   pip state)
-2. Rebuilds `/dev/bus/usb/<bus>/<dev>` nodes from sysfs — the container's
-   `/dev` is its own tmpfs and doesn't propagate host USB hotplug events,
-   so device nodes go stale after every adapter replug
-3. Detaches `ftdi_sio` from every FTDI interface so `pyftdi` can enumerate
+1. Creates / activates a project-local `.venv` when the active Python
+   isn't isolated (system Python is PEP 668-managed on Ubuntu 23.04+)
+2. Installs `pyserial` / `pyftdi` into the active env if missing
+3. Rebuilds stale device nodes from sysfs — both
+   `/dev/bus/usb/<bus>/<dev>` (FTDI adapters) and `/dev/ttyACM*` (the
+   ESP32 CDC serial) — because the container's `/dev` is its own
+   tmpfs and doesn't receive host USB hotplug events
+4. Detaches `ftdi_sio` from every FTDI interface so `pyftdi` can enumerate
    cleanly (the host kernel auto-binds `ftdi_sio` to FTDI devices on every
    USB enumeration)
-4. Runs `python3 bridge.py`
+5. Runs `python3 bridge.py`
 
-A host-level udev rule on the NUC can eliminate steps 2 and 3 permanently —
+A host-level udev rule on the NUC can eliminate steps 3 and 4 permanently —
 see [SETUP_UBUNTU.md](SETUP_UBUNTU.md) for the rule. Without it, run
 `./launch_bridge.sh` every time and it stays self-healing.
 
@@ -158,10 +165,12 @@ see [SETUP_UBUNTU.md](SETUP_UBUNTU.md) for the rule. Without it, run
 
 - **Close any serial monitor** holding `/dev/ttyACM0` (or COM<N> on Windows)
   — it shares the port with the bridge.
-- **Verify USB2CAN port numbers** (see the previous section) and update
-  `PORT_*` in [bridge.py](bridge.py) if the enumeration order changed.
 - **Plug in all three USB2CAN adapters and the ESP32-S3-BOX-3** before
-  starting. Missing adapters will surface as an open-port error.
+  starting. Missing X surfaces as `RuntimeError: X adapter (serial=...)
+  not connected`; missing Z adapter surfaces as `Need 2 Z adapters`.
+- **Verify `SERIAL_X`** in [bridge.py](bridge.py) matches the physical
+  X adapter (only needed when hardware changes — see the previous
+  section).
 
 The Windows `.bat` ends with `pause`, so error messages stay on screen until
 you press a key. The Linux `.sh` runs in the current terminal; output stays
@@ -173,9 +182,12 @@ Defaults (edit at the top of [bridge.py](bridge.py) if needed):
 |---------|---------|-------------|
 | `ESP32_PORT` | `/dev/ttyACM0` (Linux) / `COM6` (Windows) | ESP32 USB serial port |
 | `ESP32_BAUD` | `115200` | Serial baud rate |
-| `PORT_Z_A` / `PORT_Z_B` / `PORT_X` | adapter indices | USB2CAN adapter enumeration order — verify with the helper command above and update to match your physical wiring |
-| `JOG_SPEED_RPM` | `300` | Jog speed (10–3000) |
+| `SERIAL_X` | `'NTAM63XD'` | FTDI chip serial of the X-axis adapter; Z adapters are auto-assigned from whatever remains |
+| `JOG_SPEED_RPM` | `200` | Jog speed (10–3000) |
+| `JOG_ACCEL` | `0` | Jog acceleration (0–255) |
 | `Z_INVERT` / `X_INVERT` | `False` | Flip the physical rotation direction |
+| `HOMING_ENABLED` | `True` | Run `home_all()` on startup. Set False when bringing up new wiring so a wrong direction won't slam the mechanism into an end-stop |
+| `HOME_DIR_Z` / `HOME_DIR_X` | `0x00` / `0x01` | Direction byte sent to MKS `0x90`. Picks which limit switch (the one in this direction of travel) becomes the origin |
 
 ## Folder layout
 
@@ -219,7 +231,7 @@ One ASCII line per command, terminated with `\n` (ESP32 → PC).
 | `CMD:Z0` | Stop Z axis |
 | `CMD:X+` / `CMD:X-` | Start X-axis jog |
 | `CMD:X0` | Stop X axis |
-| `CMD:HOME` | Home all axes (currently commented out in `bridge.py`) |
+| `CMD:HOME` | Home all axes (uses `HOME_DIR_Z` / `HOME_DIR_X` per axis) |
 
 Any other line from the ESP32 is silently ignored by `bridge.py`.
 
@@ -230,12 +242,18 @@ Any other line from the ESP32 is silently ignored by `bridge.py`.
   carries data lines. The BOX-3 needs the USB-C **data** port.
 - **`bridge.py` can't open the serial port**: `idf.py monitor` may still
   be holding the same port.
-- **Button press moves the wrong axis / only some motors respond**:
-  USB2CAN adapter enumeration order has shifted. Re-run the port-mapping
-  helper (see "Verify USB2CAN adapter port numbers") and update `PORT_*`
-  in `bridge.py`.
-- **Motor turns the wrong way**: Toggle `Z_INVERT` / `X_INVERT` in
-  `bridge.py`.
+- **Button press moves the wrong axis**: the X adapter's serial doesn't
+  match `SERIAL_X`. Re-run the helper from "First-time setup: identify
+  the X adapter serial" and update `SERIAL_X` in `bridge.py`.
+- **Motor turns the wrong way**: toggle `Z_INVERT` / `X_INVERT` in
+  `bridge.py` (or fix the wiring once and leave the flag False).
+- **Homing moves toward the wrong end**: flip `HOME_DIR_Z` or
+  `HOME_DIR_X` between `0x00` and `0x01`.
+- **First opposite-direction jog after hitting an end-stop is ignored**:
+  fixed in `mks_motor.py` — `jog()` queries IO state (0x34) and pre-sends
+  an absorbed F6 when a limit is closed. If you still see this, the
+  active-low limit interpretation may be inverted for your wiring; check
+  the comment in `_is_at_limit()`.
 - **No CAN response**: Check the bus termination (with all devices
   powered off, CAN_H↔CAN_L should measure ≈ 60 Ω).
 - **`[SETUP] FAILED` / `No response for 0x82`**: MKS firmware occasionally
