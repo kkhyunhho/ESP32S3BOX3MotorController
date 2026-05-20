@@ -11,14 +11,19 @@ set -e
 
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
-# Ensure the Python on PATH is in an isolated env. A conda env that was
-# created without python (e.g. `conda create -n foo` with no version)
-# leaves python3 pointing at the PEP 668-managed system Python on Ubuntu
-# 23.04+, even though CONDA_PREFIX is set. Detect that and fall back to
-# a project-local .venv that we own.
-is_isolated=$(python3 -c 'import sys; print(sys.prefix != sys.base_prefix)' 2>/dev/null || echo "False")
-if [[ "$is_isolated" != "True" ]]; then
-    echo "Active python is not isolated ($(python3 -c 'import sys; print(sys.prefix)'))."
+# Ensure the active Python is isolated from the host's PEP 668-managed
+# system install. Accepted as isolated:
+#   - conda env (CONDA_PREFIX set AND python3 lives under it)
+#   - venv     (VIRTUAL_ENV set AND python3 lives under it)
+# Empty conda envs (e.g. `conda create -n foo` with no version) leave
+# CONDA_PREFIX set but python3 falls back to /usr/bin/python3, which we
+# treat as not isolated.
+py_prefix=$(python3 -c 'import sys; print(sys.prefix)' 2>/dev/null || echo "")
+isolated=false
+[[ -n "${VIRTUAL_ENV:-}"   && "$py_prefix" == "${VIRTUAL_ENV}"*   ]] && isolated=true
+[[ -n "${CONDA_PREFIX:-}"  && "$py_prefix" == "${CONDA_PREFIX}"*  ]] && isolated=true
+if ! $isolated; then
+    echo "Active python is not isolated (prefix=${py_prefix:-unknown})."
     if [[ ! -d .venv ]]; then
         echo "Creating project-local ./.venv ..."
         python3 -m venv .venv
@@ -34,9 +39,15 @@ fi
 python3 -c "import serial" 2>/dev/null || python3 -m pip install --quiet pyserial
 python3 -c "import pyftdi" 2>/dev/null || python3 -m pip install --quiet pyftdi
 
-# Refresh FTDI device nodes from sysfs (fixes stale /dev after USB replug)
+# Refresh stale device nodes from sysfs. The container's /dev is its own
+# tmpfs and doesn't receive host USB hotplug events, so:
+#   - /dev/bus/usb/<bus>/<dev> for FTDI 0403:6001 USB2CAN adapters
+#   - /dev/ttyACM* for the ESP32-S3-BOX-3 CDC serial
+# both have to be reconstructed from sysfs on every launch.
 python3 << 'PY'
 import os
+
+# FTDI raw USB nodes (libusb path, used by pyftdi)
 for d in os.listdir('/sys/bus/usb/devices'):
     vid_path = f'/sys/bus/usb/devices/{d}/idVendor'
     if not os.path.exists(vid_path):
@@ -52,6 +63,21 @@ for d in os.listdir('/sys/bus/usb/devices'):
         os.mknod(node, 0o666 | 0o020000, os.makedev(189, minor))
         os.chmod(node, 0o666)
         print(f"created {node} (minor={minor})")
+
+# CDC-ACM serial nodes (ESP32 + anything else that registers as ACM).
+# major:minor is published by the kernel at /sys/class/tty/<name>/dev.
+for name in sorted(os.listdir('/sys/class/tty')):
+    if not name.startswith('ttyACM'):
+        continue
+    dev_attr = f'/sys/class/tty/{name}/dev'
+    if not os.path.exists(dev_attr):
+        continue
+    major, minor = (int(x) for x in open(dev_attr).read().strip().split(':'))
+    node = f'/dev/{name}'
+    if not os.path.exists(node):
+        os.mknod(node, 0o666 | 0o020000, os.makedev(major, minor))
+        os.chmod(node, 0o666)
+        print(f"created {node} ({major}:{minor})")
 PY
 
 # Release every FTDI interface from ftdi_sio
