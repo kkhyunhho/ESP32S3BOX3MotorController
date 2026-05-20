@@ -72,18 +72,26 @@ class MKSMotor:
         self.can_id = can_id
 
     @classmethod
-    def open(cls, port=0, can_id=0x01):
+    def open(cls, port=0, can_id=0x01, serial=None):
         """Open FTDI device and return a ready MKSMotor.
 
         Args:
-            port: FTDI device index (default 0).
+            port: FTDI device enumeration index. Ignored when
+                serial is provided. Defaults to 0.
             can_id: CAN bus ID for this motor.
+            serial: FTDI chip serial number (e.g. "NTAM63XD").
+                When set, the adapter is picked by serial rather
+                than enumeration index — robust against USB
+                re-enumeration order changes.
 
         Returns:
             Configured MKSMotor instance.
         """
         dev = Ftdi()
-        dev.open(cls._ftdi_vid, cls._ftdi_pid, index=port)
+        if serial is not None:
+            dev.open(cls._ftdi_vid, cls._ftdi_pid, serial=serial)
+        else:
+            dev.open(cls._ftdi_vid, cls._ftdi_pid, index=port)
         dev.set_bitmode(cls._ftdi_bitmode_mask, Ftdi.BitMode(cls._ftdi_bitmode_value))
         dev.set_latency_timer(cls._ftdi_latency_ms)
         dev.purge_buffers()
@@ -367,7 +375,30 @@ class MKSMotor:
             print("[SETUP] FAILED")
         return ok
 
-    def home(self, speed_rpm=180):
+    def enable_endstops(self, direction=0x01, speed_rpm=180):
+        """Arm the left/right limit switches without running homing.
+
+        Sends 0x90 with EndLimit=1 so subsequent F4/F5/F6 motion
+        stops when a limit switch is triggered. Homing parameters
+        (direction, speed) are written too because 0x90 is a single
+        composite command — pass the same direction you would hand
+        to home() so a later home() doesn't need to reconfigure.
+
+        Args:
+            direction: Byte 1 of 0x90 (homeDir). 0x00 / 0x01.
+            speed_rpm: Bytes 3-4 of 0x90 (homeSpeed). Only used if
+                home() is later invoked.
+
+        Returns:
+            True if the motor accepted the command.
+        """
+        speed_bytes = self._int16_bytes(speed_rpm)
+        # homeTrig=0, EndLimit=1, hm_mode=0 (origin switch)
+        return self._send(
+            0x90, 0x00, direction, *speed_bytes, 0x01, 0x00, silent=True
+        ) == 0x01
+
+    def home(self, speed_rpm=180, direction=0x01):
         """Run homing sequence and enable limit switches.
 
         Finds the origin switch, sets the zero point,
@@ -379,12 +410,21 @@ class MKSMotor:
         opposite. Direction values are swapped here.
 
         Args:
-            speed_rpm: Homing speed in RPM (default 90).
+            speed_rpm: Homing speed in RPM (default 180).
+            direction: Byte 1 of the 0x90 command. The motor
+                travels in this direction during homing, so
+                whichever limit switch sits on that side
+                becomes the origin. Flip 0x00 <-> 0x01 to
+                home off the opposite limit.
         """
-        print(f"{'=' * 40}\nHOMING (speed={speed_rpm} RPM)\n{'=' * 40}")
+        print(
+            f"{'=' * 40}\n"
+            f"HOMING (speed={speed_rpm} RPM, dir=0x{direction:02X})\n"
+            f"{'=' * 40}"
+        )
         speed_bytes = self._int16_bytes(speed_rpm)
 
-        self._send(0x90, 0x00, 0x01, *speed_bytes, 0x00, 0x00)
+        self._send(0x90, 0x00, direction, *speed_bytes, 0x00, 0x00)
 
         self._send(0x91)
         print("Moving toward origin switch...")
@@ -392,7 +432,7 @@ class MKSMotor:
 
         if status == 0x02:
             print("Homing complete. Zero point set.")
-            self._send(0x90, 0x00, 0x01, *speed_bytes, 0x01, 0x00)
+            self._send(0x90, 0x00, direction, *speed_bytes, 0x01, 0x00)
             print("Limit switches enabled.")
 
             coord = int(
@@ -529,14 +569,16 @@ class MKSMotor:
         )
 
     @staticmethod
-    def home_sync(motors, barrier=None):
+    def home_sync(motors, direction=0x01, barrier=None):
         """Run homing on multiple motors in parallel.
 
         Args:
             motors: List of MKSMotor instances to home together.
+            direction: Forwarded to home() on each motor; the group
+                shares a single homing direction.
             barrier: Optional threading.Barrier.
         """
-        MKSMotor._sync(motors, lambda m: m.home(), barrier)
+        MKSMotor._sync(motors, lambda m: m.home(direction=direction), barrier)
 
     # --- Manual command ---
 
