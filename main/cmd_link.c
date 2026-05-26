@@ -1,6 +1,7 @@
 #include "cmd_link.h"
 
 #include <errno.h>
+#include <stdio.h>
 #include <string.h>
 
 #include "freertos/FreeRTOS.h"
@@ -8,6 +9,7 @@
 #include "freertos/semphr.h"
 
 #include "esp_log.h"
+#include "esp_timer.h"
 
 #include "lwip/sockets.h"
 #include "lwip/inet.h"
@@ -28,6 +30,12 @@ static int s_client_fd = -1;
 static SemaphoreHandle_t s_mutex;
 static uint16_t s_port;
 
+/* Diagnostics state — all protected by s_mutex. Sized to comfortably
+ * hold one peer endpoint string and one CMD:* line. */
+static char s_peer[24];           /* "xxx.xxx.xxx.xxx:ppppp" + NUL */
+static char s_last_cmd[24];       /* longest is "CMD:HOME" — keep slack */
+static int64_t s_last_send_us;    /* 0 means "no send yet since boot" */
+
 void cmd_link_send(const char *line)
 {
     if (line == NULL) {
@@ -47,7 +55,24 @@ void cmd_link_send(const char *line)
         /* shutdown wakes the recv() in server_task; that task does the
          * actual close so the fd is freed in exactly one place. */
         shutdown(fd, SHUT_RDWR);
+        return;
     }
+
+    /* Stash the command + timestamp for the diagnostics UI. Drop the
+     * trailing newline so the label reads "CMD:Z+" instead of forcing
+     * a layout break. */
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    size_t copy_len = len;
+    if (copy_len > 0 && line[copy_len - 1] == '\n') {
+        copy_len--;
+    }
+    if (copy_len >= sizeof(s_last_cmd)) {
+        copy_len = sizeof(s_last_cmd) - 1;
+    }
+    memcpy(s_last_cmd, line, copy_len);
+    s_last_cmd[copy_len] = '\0';
+    s_last_send_us = esp_timer_get_time();
+    xSemaphoreGive(s_mutex);
 }
 
 static void server_task(void *arg)
@@ -115,6 +140,8 @@ static void server_task(void *arg)
 
         xSemaphoreTake(s_mutex, portMAX_DELAY);
         s_client_fd = client;
+        snprintf(s_peer, sizeof(s_peer), "%s:%u",
+                 ip, ntohs(caddr.sin_port));
         xSemaphoreGive(s_mutex);
 
         /* Block until the client closes or cmd_link_send shuts the fd
@@ -129,10 +156,63 @@ static void server_task(void *arg)
         xSemaphoreTake(s_mutex, portMAX_DELAY);
         if (s_client_fd == client) {
             s_client_fd = -1;
+            s_peer[0] = '\0';
         }
         xSemaphoreGive(s_mutex);
         close(client);
     }
+}
+
+bool cmd_link_has_client(void)
+{
+    if (s_mutex == NULL) {
+        return false;
+    }
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool connected = (s_client_fd >= 0);
+    xSemaphoreGive(s_mutex);
+    return connected;
+}
+
+void cmd_link_get_peer(char *out, size_t cap)
+{
+    if (out == NULL || cap == 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (s_mutex == NULL) {
+        return;
+    }
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    strncpy(out, s_peer, cap - 1);
+    out[cap - 1] = '\0';
+    xSemaphoreGive(s_mutex);
+}
+
+void cmd_link_get_last_cmd(char *out, size_t cap)
+{
+    if (out == NULL || cap == 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (s_mutex == NULL) {
+        return;
+    }
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    strncpy(out, s_last_cmd, cap - 1);
+    out[cap - 1] = '\0';
+    xSemaphoreGive(s_mutex);
+}
+
+int64_t cmd_link_last_send_us(void)
+{
+    if (s_mutex == NULL) {
+        return 0;
+    }
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    int64_t ts = s_last_send_us;
+    xSemaphoreGive(s_mutex);
+    return ts;
 }
 
 esp_err_t cmd_link_start(uint16_t port)

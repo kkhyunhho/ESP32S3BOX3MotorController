@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "esp_err.h"
@@ -56,6 +57,17 @@ bool            network_is_connected(void);
  *                     UINT32_MAX waits forever.
  */
 void            network_wait_connected(uint32_t timeout_ms);
+
+/* Status getters for the on-device diagnostics screen. All write an
+ * empty string ("") into `out` when the data is not available (e.g.
+ * before association). `cap` must include room for the trailing NUL. */
+void            network_get_ssid(char *out, size_t cap);
+void            network_get_ip(char *out, size_t cap);
+void            network_get_mac(char *out, size_t cap);
+
+/* Current RSSI in dBm from the associated AP. Returns 0 when not
+ * connected (real RSSI values are negative, so 0 is unambiguous). */
+int             network_get_rssi(void);
 
 #ifdef __cplusplus
 }

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #include "esp_err.h"
@@ -34,6 +36,21 @@ esp_err_t cmd_link_start(uint16_t port);
  * Thread-safe; intended to be called from the LVGL UI task.
  */
 void cmd_link_send(const char *line);
+
+/* Diagnostics getters — used by the Status UI tab.
+ *
+ * cmd_link_has_client:   true iff a TCP client is currently connected.
+ * cmd_link_get_peer:     copies "ip:port" of the connected client, or
+ *                        "" when none. `cap` includes the NUL.
+ * cmd_link_get_last_cmd: copies the most recent line that was handed
+ *                        to send() (trailing '\n' stripped), or "" if
+ *                        nothing has been sent since boot.
+ * cmd_link_last_send_us: `esp_timer_get_time()` timestamp of the last
+ *                        successful send; 0 when never. */
+bool    cmd_link_has_client(void);
+void    cmd_link_get_peer(char *out, size_t cap);
+void    cmd_link_get_last_cmd(char *out, size_t cap);
+int64_t cmd_link_last_send_us(void);
 
 #ifdef __cplusplus
 }

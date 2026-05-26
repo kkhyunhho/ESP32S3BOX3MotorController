@@ -128,3 +128,61 @@ void network_wait_connected(uint32_t timeout_ms)
     xEventGroupWaitBits(s_event_group, NET_BIT_CONNECTED,
                         pdFALSE, pdTRUE, ticks);
 }
+
+void network_get_ssid(char *out, size_t cap)
+{
+    if (out == NULL || cap == 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (s_state != NETWORK_STATE_CONNECTED) {
+        return;
+    }
+    wifi_ap_record_t ap;
+    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+        strncpy(out, (const char *)ap.ssid, cap - 1);
+        out[cap - 1] = '\0';
+    }
+}
+
+void network_get_ip(char *out, size_t cap)
+{
+    if (out == NULL || cap == 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (s_state != NETWORK_STATE_CONNECTED || s_netif == NULL) {
+        return;
+    }
+    esp_netif_ip_info_t info;
+    if (esp_netif_get_ip_info(s_netif, &info) == ESP_OK) {
+        snprintf(out, cap, IPSTR, IP2STR(&info.ip));
+    }
+}
+
+void network_get_mac(char *out, size_t cap)
+{
+    if (out == NULL || cap == 0) {
+        return;
+    }
+    out[0] = '\0';
+    uint8_t mac[6];
+    /* MAC is available as soon as esp_wifi_init() runs, before
+     * association, so don't gate on s_state here. */
+    if (esp_wifi_get_mac(WIFI_IF_STA, mac) == ESP_OK) {
+        snprintf(out, cap, "%02X:%02X:%02X:%02X:%02X:%02X",
+                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+    }
+}
+
+int network_get_rssi(void)
+{
+    if (s_state != NETWORK_STATE_CONNECTED) {
+        return 0;
+    }
+    wifi_ap_record_t ap;
+    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+        return ap.rssi;
+    }
+    return 0;
+}

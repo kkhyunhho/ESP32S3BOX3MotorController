@@ -1,37 +1,62 @@
 #include "ui.h"
 #include "motor_cmd.h"
+#include "cmd_link.h"
+#include "network.h"
 #include "lvgl.h"
+#include "esp_timer.h"
+
+#include <stdio.h>
 
 /* ── Display dimensions ─────────────────────────────────────────────── */
 #define SCR_W  320
 #define SCR_H  240
 
-/* ── Dial (X/Z quadrant circle) ─────────────────────────────────────── */
+/* Tab bar steals a strip from the top; the rest is per-tab content. */
+#define TAB_BAR_H  28
+#define CONTENT_H  (SCR_H - TAB_BAR_H)
+
+/* ── Dial (X/Z quadrant circle) — sizes are relative to CONTENT_H now. */
 #define LEFT_W  210
-#define DIAL_D  200
+#define DIAL_D  180
 #define DIAL_X  ((LEFT_W - DIAL_D) / 2)
-#define DIAL_Y  ((SCR_H  - DIAL_D) / 2)
+#define DIAL_Y  ((CONTENT_H - DIAL_D) / 2)
 
 /* ── Y placeholder panel ────────────────────────────────────────────── */
 #define RIGHT_X  (LEFT_W + 4)
 #define RIGHT_W  (SCR_W - LEFT_W - 4)
-#define Y_BTN_H  ((SCR_H / 2) - 6)
+#define Y_BTN_H  ((CONTENT_H / 2) - 6)
 
 /* ── Colours ─────────────────────────────────────────────────────────── */
-#define COL_BG    0x1A1A2E
-#define COL_Z     0x2E86C1
-#define COL_Z_PR  0x1A4F72
-#define COL_X     0x1E8449
-#define COL_X_PR  0x0E6251
-#define COL_Y      0xB7770D
-#define COL_HOME   0xC0392B
-#define COL_TEXT   0xECF0F1
+#define COL_BG       0x1A1A2E
+#define COL_Z        0x2E86C1
+#define COL_Z_PR     0x1A4F72
+#define COL_X        0x1E8449
+#define COL_X_PR     0x0E6251
+#define COL_Y        0xB7770D
+#define COL_HOME     0xC0392B
+#define COL_TEXT     0xECF0F1
+#define COL_TEXT_DIM 0x808896
+#define COL_OK       0x4CAF50  /* RSSI: strong / TCP: connected */
+#define COL_WARN     0xFFC107  /* RSSI: medium                  */
+#define COL_BAD      0xE53935  /* RSSI: weak / TCP: no client   */
+#define COL_OFF      0x404858  /* unlit RSSI bar                */
 #define HOME_BTN_D 44
 
 /* ── Jogging state ──────────────────────────────────────────────────── */
 static axis_t s_active_axis;
 static dir_t  s_active_dir;
 static bool   s_jogging = false;
+
+/* ── Status-tab widgets, updated by the 1 Hz refresh timer ──────────── */
+static lv_obj_t *s_lbl_wifi_state;
+static lv_obj_t *s_lbl_ssid;
+static lv_obj_t *s_lbl_ip;
+static lv_obj_t *s_lbl_rssi;
+static lv_obj_t *s_lbl_mac;
+static lv_obj_t *s_lbl_tcp_state;
+static lv_obj_t *s_lbl_peer;
+static lv_obj_t *s_lbl_last_cmd;
+static lv_obj_t *s_rssi_bars[4];
 
 /* ── Draw one filled arc sector (angles: 0=3 o'clock, CW, degrees) ──── */
 static void draw_sector(lv_layer_t *layer,
@@ -183,10 +208,10 @@ static lv_obj_t *create_dial(lv_obj_t *parent)
         lv_align_t  align;
         int32_t     ox, oy;
     } labels[4] = {
-        { "Z " LV_SYMBOL_UP,    LV_ALIGN_TOP_MID,    0,  12 },
-        { "Z " LV_SYMBOL_DOWN,  LV_ALIGN_BOTTOM_MID, 0, -12 },
-        { LV_SYMBOL_LEFT " X",  LV_ALIGN_LEFT_MID,   12,  0 },
-        { "X " LV_SYMBOL_RIGHT, LV_ALIGN_RIGHT_MID, -12,  0 },
+        { "Z " LV_SYMBOL_UP,    LV_ALIGN_TOP_MID,    0,  8 },
+        { "Z " LV_SYMBOL_DOWN,  LV_ALIGN_BOTTOM_MID, 0, -8 },
+        { LV_SYMBOL_LEFT " X",  LV_ALIGN_LEFT_MID,   8,  0 },
+        { "X " LV_SYMBOL_RIGHT, LV_ALIGN_RIGHT_MID, -8,  0 },
     };
     for (int i = 0; i < 4; i++) {
         lv_obj_t *lbl = lv_label_create(parent);
@@ -241,6 +266,200 @@ static lv_obj_t *make_y_btn(lv_obj_t *parent,
     return btn;
 }
 
+/* ── Control tab — original dial + Y placeholder content ────────────── */
+static void build_control_tab(lv_obj_t *tab)
+{
+    lv_obj_set_style_pad_all(tab, 0, 0);
+    lv_obj_set_style_bg_color(tab, lv_color_hex(COL_BG), 0);
+    lv_obj_set_style_bg_opa(tab, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(tab, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *div = lv_obj_create(tab);
+    lv_obj_remove_style_all(div);
+    lv_obj_set_pos(div, LEFT_W, 0);
+    lv_obj_set_size(div, 4, CONTENT_H);
+    lv_obj_set_style_bg_color(div, lv_color_hex(0x3D3D3D), 0);
+    lv_obj_set_style_bg_opa(div, LV_OPA_COVER, 0);
+
+    create_dial(tab);
+
+    make_y_btn(tab, RIGHT_X, 2,                RIGHT_W, Y_BTN_H, "Y " LV_SYMBOL_UP);
+    make_y_btn(tab, RIGHT_X, CONTENT_H / 2 + 2, RIGHT_W, Y_BTN_H, "Y " LV_SYMBOL_DOWN);
+}
+
+/* ── Status-tab helpers ─────────────────────────────────────────────── */
+
+/* RSSI dBm to a 0..4 bar count, mirroring how phones quantize signal. */
+static int rssi_to_bars(int rssi)
+{
+    if (rssi == 0)           return 0;   /* "not connected" sentinel */
+    if (rssi >= -50)         return 4;
+    if (rssi >= -65)         return 3;
+    if (rssi >= -75)         return 2;
+    if (rssi >= -85)         return 1;
+    return 0;
+}
+
+static const char *rssi_quality_label(int rssi)
+{
+    int b = rssi_to_bars(rssi);
+    switch (b) {
+        case 4:  return "excellent";
+        case 3:  return "good";
+        case 2:  return "fair";
+        case 1:  return "weak";
+        default: return rssi == 0 ? "—" : "lost";
+    }
+}
+
+/* Build the 4 phone-style RSSI bars next to the RSSI text. Bars grow
+ * in height from left to right; the lit ones take a colour that
+ * reflects overall signal quality. */
+static void build_rssi_bars(lv_obj_t *parent, int x, int baseline_y)
+{
+    const int bar_w   = 5;
+    const int bar_gap = 3;
+    const int heights[4] = { 5, 9, 13, 17 };
+    for (int i = 0; i < 4; i++) {
+        lv_obj_t *bar = lv_obj_create(parent);
+        lv_obj_remove_style_all(bar);
+        lv_obj_set_size(bar, bar_w, heights[i]);
+        lv_obj_set_pos(bar,
+                       x + i * (bar_w + bar_gap),
+                       baseline_y - heights[i]);
+        lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(bar, 1, 0);
+        lv_obj_set_style_bg_color(bar, lv_color_hex(COL_OFF), 0);
+        s_rssi_bars[i] = bar;
+    }
+}
+
+static void update_rssi_bars(int rssi)
+{
+    int lit = rssi_to_bars(rssi);
+    uint32_t lit_col = (lit >= 3) ? COL_OK :
+                       (lit >= 2) ? COL_WARN :
+                                    COL_BAD;
+    for (int i = 0; i < 4; i++) {
+        lv_obj_set_style_bg_color(s_rssi_bars[i],
+            lv_color_hex(i < lit ? lit_col : COL_OFF), 0);
+    }
+}
+
+/* Add one "Key: value" row at (x, y) and store the value-label pointer
+ * so the periodic timer can update it. The key label uses dim text;
+ * the value uses bright. */
+static void add_kv_row(lv_obj_t *parent, int x, int y,
+                       const char *key, lv_obj_t **value_out)
+{
+    lv_obj_t *k = lv_label_create(parent);
+    lv_label_set_text(k, key);
+    lv_obj_set_style_text_color(k, lv_color_hex(COL_TEXT_DIM), 0);
+    lv_obj_set_style_text_font(k, &lv_font_montserrat_14, 0);
+    lv_obj_set_pos(k, x, y);
+
+    lv_obj_t *v = lv_label_create(parent);
+    lv_label_set_text(v, "—");
+    lv_obj_set_style_text_color(v, lv_color_hex(COL_TEXT), 0);
+    lv_obj_set_style_text_font(v, &lv_font_montserrat_14, 0);
+    lv_obj_set_pos(v, x + 56, y);
+    *value_out = v;
+}
+
+/* ── Periodic refresh — 1 Hz LVGL timer ─────────────────────────────── */
+static void status_refresh_cb(lv_timer_t *t)
+{
+    (void)t;
+    char buf[40];
+
+    /* Wi-Fi block */
+    const char *state_str;
+    switch (network_get_state()) {
+    case NETWORK_STATE_CONNECTED:    state_str = "CONNECTED";    break;
+    case NETWORK_STATE_CONNECTING:   state_str = "CONNECTING…";  break;
+    case NETWORK_STATE_DISCONNECTED: state_str = "DISCONNECTED"; break;
+    default:                         state_str = "IDLE";         break;
+    }
+    lv_label_set_text(s_lbl_wifi_state, state_str);
+
+    network_get_ssid(buf, sizeof(buf));
+    lv_label_set_text(s_lbl_ssid, buf[0] ? buf : "—");
+
+    network_get_ip(buf, sizeof(buf));
+    lv_label_set_text(s_lbl_ip, buf[0] ? buf : "—");
+
+    int rssi = network_get_rssi();
+    if (rssi != 0) {
+        lv_label_set_text_fmt(s_lbl_rssi, "%d dBm  %s",
+                              rssi, rssi_quality_label(rssi));
+    } else {
+        lv_label_set_text(s_lbl_rssi, "—");
+    }
+    update_rssi_bars(rssi);
+
+    network_get_mac(buf, sizeof(buf));
+    lv_label_set_text(s_lbl_mac, buf[0] ? buf : "—");
+
+    /* TCP block */
+    bool has = cmd_link_has_client();
+    lv_label_set_text(s_lbl_tcp_state, has ? "bridge.py connected" : "no client");
+    lv_obj_set_style_text_color(s_lbl_tcp_state,
+        lv_color_hex(has ? COL_OK : COL_BAD), 0);
+
+    cmd_link_get_peer(buf, sizeof(buf));
+    lv_label_set_text(s_lbl_peer, buf[0] ? buf : "—");
+
+    int64_t last_us = cmd_link_last_send_us();
+    if (last_us > 0) {
+        int sec_ago = (int)((esp_timer_get_time() - last_us) / 1000000);
+        char cmd_buf[24];
+        cmd_link_get_last_cmd(cmd_buf, sizeof(cmd_buf));
+        lv_label_set_text_fmt(s_lbl_last_cmd, "%s   %ds ago",
+                              cmd_buf, sec_ago);
+    } else {
+        lv_label_set_text(s_lbl_last_cmd, "—");
+    }
+}
+
+/* ── Status tab — Wi-Fi / TCP diagnostics ───────────────────────────── */
+static void build_status_tab(lv_obj_t *tab)
+{
+    lv_obj_set_style_pad_all(tab, 8, 0);
+    lv_obj_set_style_bg_color(tab, lv_color_hex(COL_BG), 0);
+    lv_obj_set_style_bg_opa(tab, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(tab, LV_OBJ_FLAG_SCROLLABLE);
+
+    const int row_h = 19;
+    int y = 0;
+
+    add_kv_row(tab, 0, y, "Wi-Fi", &s_lbl_wifi_state);  y += row_h;
+    add_kv_row(tab, 0, y, "SSID",  &s_lbl_ssid);        y += row_h;
+    add_kv_row(tab, 0, y, "IP",    &s_lbl_ip);          y += row_h;
+    add_kv_row(tab, 0, y, "RSSI",  &s_lbl_rssi);
+    /* baseline_y is the bottom of the tallest bar so they sit on
+     * the text baseline of the RSSI row. */
+    build_rssi_bars(tab, 230, y + 17);                   y += row_h;
+    add_kv_row(tab, 0, y, "MAC",   &s_lbl_mac);          y += row_h + 4;
+
+    /* Thin separator between Wi-Fi and TCP groups. */
+    lv_obj_t *sep = lv_obj_create(tab);
+    lv_obj_remove_style_all(sep);
+    lv_obj_set_size(sep, SCR_W - 24, 1);
+    lv_obj_set_pos(sep, 0, y);
+    lv_obj_set_style_bg_color(sep, lv_color_hex(0x3D3D3D), 0);
+    lv_obj_set_style_bg_opa(sep, LV_OPA_COVER, 0);
+    y += 6;
+
+    add_kv_row(tab, 0, y, "TCP",   &s_lbl_tcp_state);   y += row_h;
+    add_kv_row(tab, 0, y, "Peer",  &s_lbl_peer);        y += row_h;
+    add_kv_row(tab, 0, y, "Last",  &s_lbl_last_cmd);
+
+    /* Kick off the 1 Hz refresh — owned by LVGL, runs on its task. */
+    lv_timer_create(status_refresh_cb, 1000, NULL);
+    /* Populate immediately so the first frame is not all em-dashes. */
+    status_refresh_cb(NULL);
+}
+
 /* ── Public: build the full UI ──────────────────────────────────────── */
 void ui_create(void)
 {
@@ -248,15 +467,15 @@ void ui_create(void)
     lv_obj_set_style_bg_color(scr, lv_color_hex(COL_BG), 0);
     lv_obj_set_style_bg_opa(scr, LV_OPA_COVER, 0);
 
-    lv_obj_t *div = lv_obj_create(scr);
-    lv_obj_remove_style_all(div);
-    lv_obj_set_pos(div, LEFT_W, 0);
-    lv_obj_set_size(div, 4, SCR_H);
-    lv_obj_set_style_bg_color(div, lv_color_hex(0x3D3D3D), 0);
-    lv_obj_set_style_bg_opa(div, LV_OPA_COVER, 0);
+    lv_obj_t *tv = lv_tabview_create(scr);
+    lv_tabview_set_tab_bar_position(tv, LV_DIR_TOP);
+    lv_tabview_set_tab_bar_size(tv, TAB_BAR_H);
+    lv_obj_set_style_bg_color(tv, lv_color_hex(COL_BG), 0);
+    lv_obj_set_style_text_color(tv, lv_color_hex(COL_TEXT), 0);
 
-    create_dial(scr);
+    lv_obj_t *tab_ctrl = lv_tabview_add_tab(tv, "Control");
+    lv_obj_t *tab_stat = lv_tabview_add_tab(tv, "Status");
 
-    make_y_btn(scr, RIGHT_X, 4,              RIGHT_W, Y_BTN_H, "Y " LV_SYMBOL_UP);
-    make_y_btn(scr, RIGHT_X, SCR_H / 2 + 2, RIGHT_W, Y_BTN_H, "Y " LV_SYMBOL_DOWN);
+    build_control_tab(tab_ctrl);
+    build_status_tab(tab_stat);
 }
