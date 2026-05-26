@@ -10,6 +10,7 @@
 # log line in `idf.py monitor`. Drop it into ESP32_IP below.
 
 import socket
+import threading
 import time
 
 from mks_motor import MKSMotor, prepare_usb_nodes, release_ftdi_sio
@@ -26,6 +27,12 @@ SERIAL_X = 'NTAM63XD'
 
 JOG_SPEED_RPM = 200   # 10~3000
 JOG_ACCEL     = 0     # 0~255
+
+# move_to (CMD:MOVE …) uses percentage of MKSMotor._max_speed_rpm /
+# _max_accel — matches what CVMeasure.py already validated. Tuned low
+# so the first wireless move is unlikely to overshoot.
+MOVE_SPEED_PCT = 10
+MOVE_ACCEL_PCT = 0
 
 Z_INVERT = False
 X_INVERT = False
@@ -111,6 +118,28 @@ def main():
             except Exception as e:
                 print(f"[WARN] {label} endstop arm failed: {e}")
 
+    def move_xz(x_mm, z_mm):
+        """Drive X and Z to absolute mm targets in parallel.
+
+        Each axis blocks until its motor reports complete / limit /
+        failure, so running them on separate threads lets them move
+        at the same time instead of X-then-Z.
+        """
+        threads = [
+            threading.Thread(
+                target=lambda: MKSMotor.move_sync(
+                    z, [(z_mm, MOVE_SPEED_PCT, MOVE_ACCEL_PCT)])),
+            threading.Thread(
+                target=lambda: xm.move_to(
+                    x_mm,
+                    speed_pct=MOVE_SPEED_PCT,
+                    accel_pct=MOVE_ACCEL_PCT)),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
     handlers = {
         'Z+':   lambda: MKSMotor.jog_start(z,   True,  Z_INVERT, JOG_SPEED_RPM, JOG_ACCEL),
         'Z-':   lambda: MKSMotor.jog_start(z,   False, Z_INVERT, JOG_SPEED_RPM, JOG_ACCEL),
@@ -122,6 +151,25 @@ def main():
         'X0':   lambda: MKSMotor.jog_stop([xm], JOG_ACCEL),
         'HOME': lambda: MKSMotor.home_xz(z, xm, HOME_DIR_Z, HOME_DIR_X),
     }
+
+    def dispatch(cmd):
+        """Route a CMD: line. Simple keys go through the handlers dict;
+        MOVE carries args ("MOVE X 123 Z 234") and is parsed inline."""
+        if cmd.startswith('MOVE '):
+            try:
+                parts = cmd.split()
+                # ['MOVE', 'X', '123', 'Z', '234']
+                x_mm = int(parts[parts.index('X') + 1])
+                z_mm = int(parts[parts.index('Z') + 1])
+            except (ValueError, IndexError):
+                print(f"[WARN] bad MOVE line: {cmd!r}")
+                return
+            print(f"[MOVE] X={x_mm} mm  Z={z_mm} mm")
+            move_xz(x_mm, z_mm)
+            return
+        handler = handlers.get(cmd)
+        if handler:
+            handler()
 
     try:
         while True:
@@ -140,9 +188,7 @@ def main():
                         continue
                     cmd = line[4:]
                     print(f"[CMD] {cmd}")
-                    handler = handlers.get(cmd)
-                    if handler:
-                        handler()
+                    dispatch(cmd)
             except OSError as e:
                 print(f"[ESP32] socket error: {e}")
             finally:

@@ -2,6 +2,8 @@
 #include "cmd_link.h"
 #include "esp_log.h"
 
+#include <stdio.h>
+
 #define TAG "MOTOR"
 
 /* Commands are pushed over the TCP link (cmd_link). Drops silently
@@ -40,4 +42,11 @@ void motor_cmd_jog_stop(axis_t axis)
 void motor_cmd_home(void)
 {
     cmd_link_send("CMD:HOME\n");
+}
+
+void motor_cmd_move_to(int x_mm, int z_mm)
+{
+    char buf[32];
+    snprintf(buf, sizeof(buf), "CMD:MOVE X %d Z %d\n", x_mm, z_mm);
+    cmd_link_send(buf);
 }

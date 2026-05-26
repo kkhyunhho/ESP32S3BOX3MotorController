@@ -58,6 +58,33 @@ static lv_obj_t *s_lbl_peer;
 static lv_obj_t *s_lbl_last_cmd;
 static lv_obj_t *s_rssi_bars[4];
 
+/* ── Move-tab geometry ──────────────────────────────────────────────── */
+/* The plot lives in the LEFT pane of the tab (mirrors Jog Control's
+ * dial-on-left / placeholder-on-right split). Sized 160 × 160 so it
+ * comfortably fits with X/Z readouts and the Move button below. The
+ * 20 mm × 20 mm grid lines snap nicely to 8-pixel steps. */
+#define PLOT_SIZE       160
+#define PLOT_X_OFFSET   25    /* centres the plot in the left 210 px pane */
+#define PLOT_Y_OFFSET   4
+#define MARKER_R        6     /* radius of the cross-hair centre dot     */
+#define GRID_STEP_MM    20    /* minor grid spacing                       */
+#define GRID_MAJOR_MM   100   /* major grid every 5 minor steps           */
+
+/* Must match mks_motor.MKSMotor._max_travel_mm on the PC side; the
+ * exact mechanical travel is not known so we use the same 400 mm
+ * placeholder both ends. */
+#define MAX_TRAVEL_MM   400
+
+/* ── Move-tab widgets + state ───────────────────────────────────────── */
+static lv_obj_t *s_plot;
+static lv_obj_t *s_v_line;        /* vertical (Z) line — X position */
+static lv_obj_t *s_h_line;        /* horizontal (X) line — Z position */
+static lv_obj_t *s_marker;        /* small dot at the intersection */
+static lv_obj_t *s_lbl_target_x;
+static lv_obj_t *s_lbl_target_z;
+static int s_target_x_mm = 0;
+static int s_target_z_mm = 0;
+
 /* ── Draw one filled arc sector (angles: 0=3 o'clock, CW, degrees) ──── */
 static void draw_sector(lv_layer_t *layer,
                         int32_t cx, int32_t cy, int32_t r,
@@ -460,6 +487,229 @@ static void build_status_tab(lv_obj_t *tab)
     status_refresh_cb(NULL);
 }
 
+/* ── Move tab — 2D drag-to-target picker ────────────────────────────── */
+
+/* Draw 20 mm grid + every-5th-line major emphasis on top of the plot
+ * background. Runs from LV_EVENT_DRAW_MAIN so the lines layer over the
+ * plot bg / border but under any sibling crosshair widgets. */
+static void plot_grid_draw_cb(lv_event_t *e)
+{
+    lv_layer_t *layer = lv_event_get_layer(e);
+    lv_obj_t   *obj   = lv_event_get_target(e);
+
+    lv_area_t a;
+    lv_obj_get_coords(obj, &a);
+
+    lv_draw_line_dsc_t line;
+    lv_draw_line_dsc_init(&line);
+    line.width = 1;
+    line.opa   = LV_OPA_COVER;
+
+    for (int mm = GRID_STEP_MM; mm < MAX_TRAVEL_MM; mm += GRID_STEP_MM) {
+        bool major = (mm % GRID_MAJOR_MM == 0);
+        line.color = lv_color_hex(major ? 0x4D5278 : 0x2D3050);
+
+        int px = mm * PLOT_SIZE / MAX_TRAVEL_MM;
+
+        /* Vertical grid line at this X offset. */
+        line.p1.x = a.x1 + px;  line.p1.y = a.y1;
+        line.p2.x = a.x1 + px;  line.p2.y = a.y2;
+        lv_draw_line(layer, &line);
+
+        /* Horizontal grid line at the same offset (square plot). */
+        line.p1.x = a.x1;       line.p1.y = a.y1 + px;
+        line.p2.x = a.x2;       line.p2.y = a.y1 + px;
+        lv_draw_line(layer, &line);
+    }
+}
+
+/* Re-position the crosshair widgets + numeric labels for the current
+ * (s_target_x_mm, s_target_z_mm).
+ *
+ * The plot origin (0,0) lives at the TOP-RIGHT corner of the square
+ * so the on-screen drag direction matches the real mechanical motion
+ * (X grows leftwards, Z grows downwards). Pixel origin in LVGL is
+ * still top-left so both axes get inverted explicitly. */
+static void refresh_move_widgets(void)
+{
+    int px_x = PLOT_SIZE - s_target_x_mm * PLOT_SIZE / MAX_TRAVEL_MM;
+    int px_y = s_target_z_mm * PLOT_SIZE / MAX_TRAVEL_MM;
+
+    lv_obj_set_pos(s_v_line, PLOT_X_OFFSET + px_x - 1, PLOT_Y_OFFSET);
+    lv_obj_set_pos(s_h_line, PLOT_X_OFFSET,            PLOT_Y_OFFSET + px_y - 1);
+    lv_obj_set_pos(s_marker,
+                   PLOT_X_OFFSET + px_x - MARKER_R,
+                   PLOT_Y_OFFSET + px_y - MARKER_R);
+
+    lv_label_set_text_fmt(s_lbl_target_x, "X: %3d mm", s_target_x_mm);
+    lv_label_set_text_fmt(s_lbl_target_z, "Z: %3d mm", s_target_z_mm);
+}
+
+static void plot_event_cb(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    if (code != LV_EVENT_PRESSED && code != LV_EVENT_PRESSING) {
+        return;
+    }
+
+    lv_indev_t *indev = lv_event_get_indev(e);
+    if (indev == NULL) {
+        indev = lv_indev_active();
+    }
+    if (indev == NULL) {
+        return;
+    }
+
+    lv_point_t pt = {0, 0};
+    lv_indev_get_point(indev, &pt);
+
+    lv_area_t area;
+    lv_obj_get_coords(s_plot, &area);
+    int px = pt.x - area.x1;
+    int py = pt.y - area.y1;
+
+    if (px < 0) px = 0;
+    if (px > PLOT_SIZE) px = PLOT_SIZE;
+    if (py < 0) py = 0;
+    if (py > PLOT_SIZE) py = PLOT_SIZE;
+
+    /* Both axes inverted so the on-screen drag matches the real
+     * mechanical direction (validated against the actual rig). */
+    s_target_x_mm = (PLOT_SIZE - px) * MAX_TRAVEL_MM / PLOT_SIZE;
+    s_target_z_mm = py * MAX_TRAVEL_MM / PLOT_SIZE;
+
+    refresh_move_widgets();
+}
+
+static void confirm_event_cb(lv_event_t *e)
+{
+    (void)e;
+    motor_cmd_move_to(s_target_x_mm, s_target_z_mm);
+}
+
+static void build_move_tab(lv_obj_t *tab)
+{
+    lv_obj_set_style_pad_all(tab, 0, 0);
+    lv_obj_set_style_bg_color(tab, lv_color_hex(COL_BG), 0);
+    lv_obj_set_style_bg_opa(tab, LV_OPA_COVER, 0);
+    lv_obj_clear_flag(tab, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* Same left/right split as Jog Control: the X/Z plot lives in the
+     * left LEFT_W=210 px column, with a thin vertical divider, and
+     * the right column is reserved as the linear-motor placeholder. */
+    lv_obj_t *div = lv_obj_create(tab);
+    lv_obj_remove_style_all(div);
+    lv_obj_set_pos(div, LEFT_W, 0);
+    lv_obj_set_size(div, 4, CONTENT_H);
+    lv_obj_set_style_bg_color(div, lv_color_hex(0x3D3D3D), 0);
+    lv_obj_set_style_bg_opa(div, LV_OPA_COVER, 0);
+
+    /* The square drag area. Borders + dim background so it reads as a
+     * "plottable surface" rather than a button. */
+    s_plot = lv_obj_create(tab);
+    lv_obj_remove_style_all(s_plot);
+    lv_obj_set_size(s_plot, PLOT_SIZE, PLOT_SIZE);
+    lv_obj_set_pos(s_plot, PLOT_X_OFFSET, PLOT_Y_OFFSET);
+    lv_obj_set_style_bg_color(s_plot, lv_color_hex(0x22253A), 0);
+    lv_obj_set_style_bg_opa(s_plot, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(s_plot, lv_color_hex(0x4D5278), 0);
+    lv_obj_set_style_border_width(s_plot, 1, 0);
+    lv_obj_set_style_radius(s_plot, 0, 0);
+    lv_obj_add_flag(s_plot, LV_OBJ_FLAG_CLICKABLE);
+    /* Stop the tabview from interpreting horizontal drag as a tab
+     * swipe — we want it to feed the plot's PRESSING event instead. */
+    lv_obj_clear_flag(s_plot, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    lv_obj_clear_flag(s_plot, LV_OBJ_FLAG_SCROLLABLE);
+
+    /* 20 mm grid drawn by a DRAW_MAIN callback (no widget overhead). */
+    lv_obj_add_event_cb(s_plot, plot_grid_draw_cb, LV_EVENT_DRAW_MAIN, NULL);
+
+    /* Cross-hair: a thin vertical bar (Z axis line) at the target X
+     * and a thin horizontal bar (X axis line) at the target Z. They
+     * are children of the tab (not s_plot) so they can be repositioned
+     * with absolute set_pos against the same coordinate origin. */
+    s_v_line = lv_obj_create(tab);
+    lv_obj_remove_style_all(s_v_line);
+    lv_obj_set_size(s_v_line, 2, PLOT_SIZE);
+    lv_obj_set_style_bg_color(s_v_line, lv_color_hex(COL_Z), 0);
+    lv_obj_set_style_bg_opa(s_v_line, LV_OPA_COVER, 0);
+    lv_obj_add_flag(s_v_line, LV_OBJ_FLAG_IGNORE_LAYOUT);
+
+    s_h_line = lv_obj_create(tab);
+    lv_obj_remove_style_all(s_h_line);
+    lv_obj_set_size(s_h_line, PLOT_SIZE, 2);
+    lv_obj_set_style_bg_color(s_h_line, lv_color_hex(COL_X), 0);
+    lv_obj_set_style_bg_opa(s_h_line, LV_OPA_COVER, 0);
+    lv_obj_add_flag(s_h_line, LV_OBJ_FLAG_IGNORE_LAYOUT);
+
+    s_marker = lv_obj_create(tab);
+    lv_obj_remove_style_all(s_marker);
+    lv_obj_set_size(s_marker, MARKER_R * 2, MARKER_R * 2);
+    lv_obj_set_style_radius(s_marker, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(s_marker, lv_color_hex(COL_TEXT), 0);
+    lv_obj_set_style_bg_opa(s_marker, LV_OPA_COVER, 0);
+    lv_obj_add_flag(s_marker, LV_OBJ_FLAG_IGNORE_LAYOUT);
+
+    /* Plot grabs the touch events; the crosshair widgets above sit on
+     * top of it visually but don't intercept touch. */
+    lv_obj_add_event_cb(s_plot, plot_event_cb, LV_EVENT_PRESSED,  NULL);
+    lv_obj_add_event_cb(s_plot, plot_event_cb, LV_EVENT_PRESSING, NULL);
+
+    /* Under-plot readouts + Move button — all inside the left pane. */
+    const int below_y = PLOT_Y_OFFSET + PLOT_SIZE + 6;
+
+    s_lbl_target_x = lv_label_create(tab);
+    lv_obj_set_style_text_color(s_lbl_target_x, lv_color_hex(COL_X), 0);
+    lv_obj_set_style_text_font(s_lbl_target_x, &lv_font_montserrat_18, 0);
+    lv_obj_set_pos(s_lbl_target_x, 10, below_y);
+
+    s_lbl_target_z = lv_label_create(tab);
+    lv_obj_set_style_text_color(s_lbl_target_z, lv_color_hex(COL_Z), 0);
+    lv_obj_set_style_text_font(s_lbl_target_z, &lv_font_montserrat_18, 0);
+    lv_obj_set_pos(s_lbl_target_z, 10, below_y + 18);
+
+    lv_obj_t *confirm_btn = lv_button_create(tab);
+    lv_obj_set_size(confirm_btn, 85, 36);
+    lv_obj_set_pos(confirm_btn, 115, below_y + 2);
+    lv_obj_set_style_bg_color(confirm_btn, lv_color_hex(COL_OK), 0);
+    lv_obj_set_style_bg_color(confirm_btn,
+        lv_color_hex(COL_OK >> 1 & 0x7F7F7F), LV_STATE_PRESSED);
+    lv_obj_set_style_radius(confirm_btn, 8, 0);
+    lv_obj_set_style_border_width(confirm_btn, 0, 0);
+    lv_obj_set_style_shadow_width(confirm_btn, 0, 0);
+    lv_obj_add_event_cb(confirm_btn, confirm_event_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t *confirm_lbl = lv_label_create(confirm_btn);
+    lv_label_set_text(confirm_lbl, LV_SYMBOL_OK "  Move");
+    lv_obj_set_style_text_color(confirm_lbl, lv_color_hex(COL_TEXT), 0);
+    lv_obj_set_style_text_font(confirm_lbl, &lv_font_montserrat_18, 0);
+    lv_obj_center(confirm_lbl);
+
+    /* Right pane reserved for the future linear-motor controls. Render
+     * a single dim box with "Linear (TBD)" so the user can see the
+     * region is intentionally claimed but not implemented yet. Mirrors
+     * Jog Control's two-Y-button placement so the two tabs feel
+     * structurally similar. */
+    lv_obj_t *linear = lv_obj_create(tab);
+    lv_obj_remove_style_all(linear);
+    lv_obj_set_pos(linear, RIGHT_X, 6);
+    lv_obj_set_size(linear, RIGHT_W, CONTENT_H - 12);
+    lv_obj_set_style_bg_color(linear, lv_color_hex(0x22253A), 0);
+    lv_obj_set_style_bg_opa(linear, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(linear, lv_color_hex(0x3D3D3D), 0);
+    lv_obj_set_style_border_width(linear, 1, 0);
+    lv_obj_set_style_radius(linear, 8, 0);
+
+    lv_obj_t *linear_lbl = lv_label_create(linear);
+    lv_label_set_text(linear_lbl, "Linear\n(TBD)");
+    lv_obj_set_style_text_align(linear_lbl, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(linear_lbl, lv_color_hex(COL_TEXT_DIM), 0);
+    lv_obj_set_style_text_font(linear_lbl, &lv_font_montserrat_18, 0);
+    lv_obj_center(linear_lbl);
+
+    refresh_move_widgets();
+}
+
 /* ── Public: build the full UI ──────────────────────────────────────── */
 void ui_create(void)
 {
@@ -473,9 +723,21 @@ void ui_create(void)
     lv_obj_set_style_bg_color(tv, lv_color_hex(COL_BG), 0);
     lv_obj_set_style_text_color(tv, lv_color_hex(COL_TEXT), 0);
 
-    lv_obj_t *tab_ctrl = lv_tabview_add_tab(tv, "Control");
+    /* Disable horizontal swipe between tabs — tab buttons remain the
+     * only way to switch. set_active() drives the programmatic scroll
+     * itself so the snap behavior is preserved when buttons are tapped. */
+    lv_obj_clear_flag(lv_tabview_get_content(tv), LV_OBJ_FLAG_SCROLLABLE);
+
+    /* Tab order: Move Control (left) | Jog Control (middle) | Status (right). */
+    lv_obj_t *tab_move = lv_tabview_add_tab(tv, "Move Control");
+    lv_obj_t *tab_ctrl = lv_tabview_add_tab(tv, "Jog Control");
     lv_obj_t *tab_stat = lv_tabview_add_tab(tv, "Status");
 
+    build_move_tab(tab_move);
     build_control_tab(tab_ctrl);
     build_status_tab(tab_stat);
+
+    /* Default landing tab — keep Jog Control front since that's the
+     * primary controller; user can swipe-by-tab to Move/Status. */
+    lv_tabview_set_active(tv, 1, LV_ANIM_OFF);
 }

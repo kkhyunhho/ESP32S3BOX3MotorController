@@ -108,7 +108,7 @@ class MKSMotor:
     _encoder_per_turn = 16384
     _max_speed_rpm = 3000
     _max_accel = 255
-    _max_travel_mm = 450
+    _max_travel_mm = 400
     _max_wait_sec = 250
 
     # FTDI device setup (USB2CAN-FIFO adapter)
