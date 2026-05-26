@@ -3,7 +3,14 @@ idf_component_register(
         "main.c"
         "ui.c"
         "motor_cmd.c"
+        "network.c"
+        "cmd_link.c"
     INCLUDE_DIRS "."
     REQUIRES
         esp-box-3
+        esp_wifi
+        esp_netif
+        esp_event
+        nvs_flash
+        lwip
 )

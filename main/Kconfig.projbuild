@@ -1,0 +1,18 @@
+menu "Motor controller"
+
+config MOTORCTRL_WIFI_SSID
+    string "WiFi SSID"
+    default ""
+    help
+        WPA2-Personal SSID for the wireless control link. Leave empty
+        to skip WiFi bring-up; the firmware continues to work over the
+        existing USB-serial path.
+
+config MOTORCTRL_WIFI_PASSWORD
+    string "WiFi password"
+    default ""
+    help
+        WPA2-Personal passphrase. Stored in the local sdkconfig only —
+        do not commit a populated sdkconfig.
+
+endmenu
