@@ -1,0 +1,11 @@
+# Python deps for the PC-side bridge.
+#
+# Install once per Python env (conda env or venv) after activating it:
+#   pip install -r requirements.txt
+#
+# Then run the scripts directly:
+#   python3 bridge.py
+#   python3 CVMeasure.py
+
+pyserial
+pyftdi

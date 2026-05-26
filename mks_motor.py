@@ -1,22 +1,101 @@
 # mks_motor.py
-# MKS SERVO57D CAN Motor Controller via USB2CAN-FIFO (FTDI FT245)
+# MKS SERVO57D CAN motor library, accessed over a per-motor USB2CAN
+# (FTDI FT232R) adapter using libusb via pyftdi.
 #
 # Architecture (bottom to top):
-#   USB2CAN binary packet (18 bytes) wraps a CAN message
-#   (8 bytes max) which contains:
-#   [cmd_code] [data...] [checksum]
+#   USB2CAN binary packet (18 bytes) wraps a CAN frame (≤8 bytes)
+#   that carries [cmd_code] [data...] [checksum] for the motor.
 #
 # Reading Guide:
-#   1. __main__          - Entry point
-#   2. send / wait       - Core CAN communication
-#   3. setup / home      - Motor initialization
-#   4. move_to           - High-level motion commands
-#   5. Motor control     - enable, disable, set_zero, read_status
+#   1. Module helpers      - prepare_usb_nodes / release_ftdi_sio
+#                            (Docker /dev recovery + ftdi_sio unbind)
+#   2. open / open_xz      - FTDI adapter open by serial number
+#   3. _send / _wait       - Core CAN communication
+#   4. setup / enable_endstops / home  - Motor initialization
+#   5. move_to / _jog      - High-level motion commands
+#                            (both gated by _is_at_limit() to absorb
+#                             the firmware's "first command after
+#                             limit-stop is dropped" quirk; _jog is
+#                             the internal primitive — public callers
+#                             use jog_start / jog_stop)
+#   6. *_sync helpers      - Multi-motor parallel control
 
+import os
+import stat
 import threading
 import time
 
 from pyftdi.ftdi import Ftdi
+
+
+def prepare_usb_nodes():
+    """Recreate USB device nodes from sysfs.
+
+    The Docker container's /dev is a private tmpfs that doesn't
+    receive host USB hotplug events, so device nodes go stale
+    after every re-enumeration. This rebuilds:
+      - /dev/bus/usb/<bus>/<dev> for FTDI 0403:6001 adapters
+        (the libusb path used by pyftdi)
+      - /dev/ttyACM* for the ESP32-S3-BOX-3 CDC serial
+
+    Idempotent — skips nodes that already exist.
+    Root-only (calls os.mknod).
+    """
+    # FTDI raw USB nodes
+    for d in os.listdir('/sys/bus/usb/devices'):
+        vid_path = f'/sys/bus/usb/devices/{d}/idVendor'
+        if not os.path.exists(vid_path):
+            continue
+        if open(vid_path).read().strip() != '0403':
+            continue
+        busnum = int(open(f'/sys/bus/usb/devices/{d}/busnum').read())
+        devnum = int(open(f'/sys/bus/usb/devices/{d}/devnum').read())
+        minor = (busnum - 1) * 128 + (devnum - 1)
+        node = f'/dev/bus/usb/{busnum:03d}/{devnum:03d}'
+        os.makedirs(os.path.dirname(node), exist_ok=True)
+        if not os.path.exists(node):
+            os.mknod(node, 0o666 | stat.S_IFCHR, os.makedev(189, minor))
+            os.chmod(node, 0o666)
+            print(f"created {node} (minor={minor})")
+
+    # CDC-ACM serial nodes (ESP32 + any other ACM device).
+    # major:minor is published by the kernel at /sys/class/tty/<name>/dev.
+    for name in sorted(os.listdir('/sys/class/tty')):
+        if not name.startswith('ttyACM'):
+            continue
+        dev_attr = f'/sys/class/tty/{name}/dev'
+        if not os.path.exists(dev_attr):
+            continue
+        major, minor = (int(x) for x in open(dev_attr).read().strip().split(':'))
+        node = f'/dev/{name}'
+        if not os.path.exists(node):
+            os.mknod(node, 0o666 | stat.S_IFCHR, os.makedev(major, minor))
+            os.chmod(node, 0o666)
+            print(f"created {node} ({major}:{minor})")
+
+
+def release_ftdi_sio():
+    """Detach the in-kernel ftdi_sio driver from every FTDI interface
+    so libusb-based access (pyftdi) can enumerate cleanly.
+
+    Required because the host kernel auto-binds ftdi_sio to FTDI
+    devices on every USB enumeration. Idempotent and root-only
+    (writes to /sys).
+    """
+    driver_dir = '/sys/bus/usb/drivers/ftdi_sio'
+    if not os.path.isdir(driver_dir):
+        return
+    for name in os.listdir(driver_dir):
+        # Real bindings look like '3-3.2:1.0'; driver control files
+        # ('bind', 'unbind', 'module', 'uevent') have no colon.
+        if ':' not in name:
+            continue
+        try:
+            with open(f'{driver_dir}/unbind', 'w') as f:
+                f.write(name)
+            print(f"unbound ftdi_sio: {name}")
+        except OSError:
+            pass
 
 
 class MKSMotor:
@@ -43,39 +122,69 @@ class MKSMotor:
     _response_retry_count = 10
     _response_retry_delay_s = 0.1
 
-    # Limit-stop recovery: the MKS firmware ignores the
-    # first motion command after a limit stop. We follow up with
-    # a small relative move to consume that skip and physically
-    # release the limit switch (sensor hysteresis means a 0.01mm
-    # twitch isn't enough — motor barely registers it). 1mm at
-    # 300 RPM takes ~20ms, visible but quick.
-    _limit_recover_delay_s = 0.5
-    _dummy_move_offset_mm = 1.0
-    _dummy_move_speed_rpm = 300
+    # Tuned timing / counts for the bring-up workflow.
+    _default_home_speed_rpm = 180   # default Hm_Speed if caller omits it
+    _setup_retry_count = 3          # firmware sometimes drops the very
+                                    # first setting command after a fresh
+                                    # CAN connection
+    _jog_dir_bit = 0x80             # F6 byte 2 bit 7: 1 = CW, 0 = CCW
 
-    _motion_cmds = {0x91, 0xF4, 0xF5, 0xF6, 0xFD, 0xFE}
+    # MKS firmware quirk: the first motion command (F4/F5/F6) sent
+    # while a limit switch is closed is silently dropped. Every
+    # motion entry-point (jog, move_to) checks _is_at_limit() first
+    # and pre-sends a sacrificial copy of the command to absorb the
+    # dropped slot. No physical dummy motion required.
+
+    # MKS command opcodes used by this file.
+    CMD_READ_IO     = 0x34   # read IN_1/IN_2/OUT_1/OUT_2 state
+    CMD_SET_MODE    = 0x82   # 0x05 selects SR_vFOC
+    CMD_SLAVE_RESP  = 0x8C   # enable active response from the motor
+    CMD_SET_HOME    = 0x90   # set homing parameters
+    CMD_START_HOME  = 0x91   # execute homing (uses last 0x90 settings)
+    CMD_MOVE_TO     = 0xF5   # absolute-coord motion
+    CMD_JOG         = 0xF6   # speed-mode jog
+
+    # Status bytes returned by the motor. The labels live in the
+    # _motion_status / _setting_status dicts below for pretty-print;
+    # these constants are for code comparisons.
+    STATUS_FAILED        = 0x00   # setting OR motion failure
+    STATUS_SUCCESS       = 0x01   # setting OK (also = "Running" for motion)
+    STATUS_RUNNING       = 0x01
+    STATUS_COMPLETE      = 0x02
+    STATUS_LIMIT_STOPPED = 0x03
+
+    # Commands that report a motion-status code (Running / Complete /
+    # Stopped by Limit) rather than a setting-status code (Success /
+    # Fail). Narrowed to what we actually send.
+    _motion_cmds = {CMD_START_HOME, CMD_MOVE_TO, CMD_JOG}
 
     _motion_status = {
-        0x00: "Failed",
-        0x01: "Running",
-        0x02: "Complete",
-        0x03: "Stopped by Limit",
-        0x05: "Sync Data Received",
+        STATUS_FAILED:        "Failed",
+        STATUS_RUNNING:       "Running",
+        STATUS_COMPLETE:      "Complete",
+        STATUS_LIMIT_STOPPED: "Stopped by Limit",
+        0x05:                 "Sync Data Received",
     }
 
     _setting_status = {
-        0x00: "Failed",
-        0x01: "Success",
+        STATUS_FAILED:  "Failed",
+        STATUS_SUCCESS: "Success",
     }
 
     # --- Construction ---
 
-    def __init__(self, dev, can_id=0x01):
+    def __init__(self, dev, can_id=0x01, coord_invert=False):
         self.dev = dev
         self.can_id = can_id
+        # When True, F5/F4 coord values are negated before being sent.
+        # Use on axes where the motor's "positive encoder direction"
+        # points INTO the closed home limit (e.g. after physically
+        # swapping the IN_1/IN_2 limit wires). F6 jog is NOT affected;
+        # the user's CW/CCW handler mapping stays as-is.
+        self.coord_invert = coord_invert
 
     @classmethod
-    def open(cls, port=0, can_id=0x01, serial=None):
+    def open(cls, port=0, can_id=0x01, serial=None, coord_invert=False):
         """Open FTDI device and return a ready MKSMotor.
 
         Args:
@@ -86,6 +195,10 @@ class MKSMotor:
                 When set, the adapter is picked by serial rather
                 than enumeration index — robust against USB
                 re-enumeration order changes.
+            coord_invert: Forwarded to MKSMotor.__init__. Flips the
+                sign of F5/F4 coord values so move_to(+mm) moves the
+                motor away from home even when its encoder positive
+                direction points into the closed home limit.
 
         Returns:
             Configured MKSMotor instance.
@@ -98,8 +211,53 @@ class MKSMotor:
         dev.set_bitmode(cls._ftdi_bitmode_mask, Ftdi.BitMode(cls._ftdi_bitmode_value))
         dev.set_latency_timer(cls._ftdi_latency_ms)
         dev.purge_buffers()
+        # FTDI bitmode + latency take a moment to settle; without this
+        # delay the first _send sometimes returns no response.
         time.sleep(0.3)
-        return cls(dev, can_id)
+        return cls(dev, can_id, coord_invert=coord_invert)
+
+    @classmethod
+    def open_xz(cls, serial_x, z_coord_invert=True):
+        """Open all three USB2CAN adapters by FTDI serial.
+
+        Picks the X adapter explicitly by serial; whichever two FTDI
+        adapters remain are assigned to Z_A and Z_B. Z order doesn't
+        matter because the paired Z motors always move together.
+
+        Args:
+            serial_x: FTDI chip serial of the X-axis adapter
+                (e.g. "NTAM63XD").
+            z_coord_invert: Apply coord_invert to the Z motors only.
+                Default True for this project because the Z limit
+                wires were physically swapped, which flips the
+                meaning of "positive coord" for those motors. Set
+                False if your Z wiring matches X's.
+
+        Returns:
+            Tuple (za, zb, x) of MKSMotor instances.
+
+        Raises:
+            RuntimeError: If serial_x is not present or fewer than
+                two Z adapters remain.
+        """
+        all_serials = [url.sn for url, _ in Ftdi.list_devices()]
+        if serial_x not in all_serials:
+            raise RuntimeError(
+                f"X adapter (serial={serial_x}) not connected. "
+                f"Found adapters: {all_serials}"
+            )
+        z_serials = [s for s in all_serials if s != serial_x]
+        if len(z_serials) < 2:
+            raise RuntimeError(
+                f"Need 2 Z adapters, only found {len(z_serials)}: {z_serials}"
+            )
+        print(f"  X  = {serial_x}")
+        print(f"  Z_A = {z_serials[0]}")
+        print(f"  Z_B = {z_serials[1]}")
+        za = cls.open(serial=z_serials[0], coord_invert=z_coord_invert)
+        zb = cls.open(serial=z_serials[1], coord_invert=z_coord_invert)
+        x  = cls.open(serial=serial_x)
+        return za, zb, x
 
     def close(self):
         """Close the underlying FTDI device."""
@@ -194,11 +352,16 @@ class MKSMotor:
     def _mm_to_coord(self, mm):
         """Convert mm distance to encoder coordinate.
 
+        Sign-flipped when self.coord_invert is True so that
+        callers can always pass non-negative mm and have move_to /
+        dummy moves go in the physically correct direction (away
+        from the closed home limit).
+
         Args:
             mm: Distance in millimeters.
 
         Returns:
-            Integer encoder count.
+            Integer encoder count (negative when coord_invert).
 
         Raises:
             ValueError: If mm is outside
@@ -209,6 +372,8 @@ class MKSMotor:
             / self._mm_per_turn
             * self._encoder_per_turn
         )
+        if self.coord_invert:
+            coord = -coord
         return coord
 
     # --- Low-level: CAN packet over USB2CAN ---
@@ -293,18 +458,15 @@ class MKSMotor:
     def _wait(self):
         """Wait for async motor response.
 
-        Blocks until the motor reports completion,
-        failure, or limit hit. Timeout resets each
-        time a "Running" response arrives.
-
-        On limit stop (0x03), the MKS firmware
-        ignores the first motion command after a
-        limit stop, so this dummy consumes that
-        skip and restores normal operation.
+        Blocks until the motor reports completion, failure, or
+        limit hit. Timeout resets each time a "Running" response
+        arrives. The "first motion command after limit-stop" skip
+        is no longer cleared here — the next motion call handles
+        it via _is_at_limit() like _jog() / move_to() do.
 
         Returns:
-            Status byte (0x02=complete, 0x03=limit,
-            etc.), or None on timeout.
+            Status byte (0x02=complete, 0x03=limit, etc.), or None
+            on timeout.
         """
         deadline = time.time() + self._max_wait_sec
 
@@ -315,32 +477,50 @@ class MKSMotor:
                 label = self._motion_status.get(status, f"0x{status:02X}")
                 print(f"[RX] {label}")
 
-                if status == 0x01:
+                if status == self.STATUS_RUNNING:
                     deadline = time.time() + self._max_wait_sec
                     continue
-                if status == 0x03:
+                if status == self.STATUS_LIMIT_STOPPED:
                     print("[LIMIT] Motor stopped by limit switch")
-                    time.sleep(self._limit_recover_delay_s)
-                    self.dev.purge_rx_buffer()
-                    coord = int(
-                        self._dummy_move_offset_mm
-                        / self._mm_per_turn
-                        * self._encoder_per_turn
-                    )
-                    dummy = (
-                        self._int16_bytes(self._dummy_move_speed_rpm)
-                        + [0]
-                        + self._int24_bytes(coord)
-                    )
-                    self._send(0xF4, *dummy, silent=True)
-                    time.sleep(self._limit_recover_delay_s)
-                    self.dev.purge_rx_buffer()
                 return status
 
+            # No frame yet — sleep a short poll interval so we don't
+            # spin the CPU while the motor is still moving.
             time.sleep(0.1)
 
         print("[ERROR] Motor not responding -- check power, wiring, and CAN")
         return None
+
+    # --- State queries ---
+
+    def _read_io_status(self):
+        """Read IO port status (CMD_READ_IO).
+
+        Returns:
+            Bit-packed byte with:
+              bit0 = IN_1 (home / left-limit)
+              bit1 = IN_2 (right-limit)
+              bit2 = OUT_1
+              bit3 = OUT_2
+            Or None if no response.
+
+            With our setup (homeTrig=0, "active low"), a bit value
+            of 0 means the corresponding switch is closed.
+        """
+        return self._send(self.CMD_READ_IO, silent=True)
+
+    def _is_at_limit(self):
+        """True if either limit switch is currently closed.
+
+        Used by _jog() and move_to() to decide whether the MKS
+        firmware's "first motion command after limit-stop is dropped"
+        workaround is needed.
+        """
+        status = self._read_io_status()
+        if status is None:
+            return False
+        # bit0 = IN_1, bit1 = IN_2. Active low (0 = closed).
+        return (status & 0x01) == 0 or (status & 0x02) == 0
 
     # --- Setup & Homing ---
 
@@ -354,17 +534,17 @@ class MKSMotor:
             False otherwise.
         """
         commands = [
-            (0x82, [0x05]),
-            (0x8C, [0x01, 0x01]),
+            (self.CMD_SET_MODE,   [0x05]),         # 0x05 = SR_vFOC
+            (self.CMD_SLAVE_RESP, [0x01, 0x01]),   # enable active response
         ]
         ok = True
-        # Retry each command up to 3 times: MKS firmware occasionally
-        # drops the first command after a fresh CAN connection.
+        # Retry each command up to _setup_retry_count times: MKS firmware
+        # occasionally drops the first command after a fresh CAN connection.
         for cmd, data in commands:
             success = False
-            for _ in range(3):
+            for _ in range(self._setup_retry_count):
                 try:
-                    if self._send(cmd, *data, silent=True) == 0x01:
+                    if self._send(cmd, *data, silent=True) == self.STATUS_SUCCESS:
                         success = True
                         break
                 except ConnectionError:
@@ -378,78 +558,104 @@ class MKSMotor:
             print("[SETUP] FAILED")
         return ok
 
-    def enable_endstops(self, direction=0x01, speed_rpm=180):
-        """Arm the left/right limit switches without running homing.
-
-        Sends 0x90 with EndLimit=1 so subsequent F4/F5/F6 motion
-        stops when a limit switch is triggered. Homing parameters
-        (direction, speed) are written too because 0x90 is a single
-        composite command — pass the same direction you would hand
-        to home() so a later home() doesn't need to reconfigure.
+    def _home_payload(self, *, home_trig=0x00, direction=0x01,
+                      speed_rpm=None, end_limit=False, hm_mode=0x00):
+        """Build the 6-byte payload for CMD_SET_HOME (0x90).
 
         Args:
-            direction: Byte 1 of 0x90 (homeDir). 0x00 / 0x01.
-            speed_rpm: Bytes 3-4 of 0x90 (homeSpeed). Only used if
-                home() is later invoked.
+            home_trig: Effective level when the home switch is closed.
+                0 = active-low (closed = 0), 1 = active-high.
+            direction: homeDir byte — direction the motor moves to
+                search for the home switch. 0x00 / 0x01.
+            speed_rpm: Hm_Speed (0-3000). Defaults to
+                ``_default_home_speed_rpm`` if None.
+            end_limit: True to enable the left/right limit switches
+                during subsequent motion. False during the homing
+                pass itself.
+            hm_mode: 0 = origin switch, 1 = mechanical-limit stall,
+                2 = single-lap zeroing.
+
+        Returns:
+            List of 6 bytes ready to pass as ``*data`` to ``_send``.
+        """
+        if speed_rpm is None:
+            speed_rpm = self._default_home_speed_rpm
+        return [
+            home_trig,
+            direction,
+            *self._int16_bytes(speed_rpm),
+            0x01 if end_limit else 0x00,
+            hm_mode,
+        ]
+
+    def enable_endstops(self, direction=0x01, speed_rpm=None):
+        """Arm the left/right limit switches without running homing.
+
+        Sends CMD_SET_HOME with end_limit=True so subsequent F4/F5/F6
+        motion stops when a limit switch is triggered. Homing
+        parameters (direction, speed) are written too because the
+        underlying 0x90 is a single composite command — pass the
+        same direction you would hand to home() so a later home()
+        doesn't need to reconfigure.
+
+        Args:
+            direction: homeDir byte (0x00 / 0x01).
+            speed_rpm: Hm_Speed; falls back to
+                ``_default_home_speed_rpm`` when omitted.
 
         Returns:
             True if the motor accepted the command.
         """
-        speed_bytes = self._int16_bytes(speed_rpm)
-        # homeTrig=0, EndLimit=1, hm_mode=0 (origin switch)
-        return self._send(
-            0x90, 0x00, direction, *speed_bytes, 0x01, 0x00, silent=True
-        ) == 0x01
+        payload = self._home_payload(
+            direction=direction, speed_rpm=speed_rpm, end_limit=True
+        )
+        return self._send(self.CMD_SET_HOME, *payload,
+                          silent=True) == self.STATUS_SUCCESS
 
-    def home(self, speed_rpm=180, direction=0x01):
+    def home(self, speed_rpm=None, direction=0x01):
         """Run homing sequence and enable limit switches.
 
-        Finds the origin switch, sets the zero point,
-        then enables limit switches for safe operation.
+        Finds the origin switch, sets the zero point, then enables
+        the limit switches for safe operation.
 
-        HARDWARE NOTE: Motor direction is physically
-        inverted due to wiring/mounting. Manual says
-        0x00=CW, 0x01=CCW, but actual movement is
-        opposite. Direction values are swapped here.
+        HARDWARE NOTE: Motor direction is physically inverted due to
+        wiring/mounting. Manual says 0x00=CW / 0x01=CCW, but actual
+        movement is opposite.
 
         Args:
-            speed_rpm: Homing speed in RPM (default 180).
-            direction: Byte 1 of the 0x90 command. The motor
-                travels in this direction during homing, so
-                whichever limit switch sits on that side
-                becomes the origin. Flip 0x00 <-> 0x01 to
-                home off the opposite limit.
+            speed_rpm: Homing speed in RPM; falls back to
+                ``_default_home_speed_rpm`` when omitted.
+            direction: homeDir byte. The motor travels in this
+                direction during homing, so whichever limit switch
+                sits on that side becomes the origin. Flip
+                0x00 <-> 0x01 to home off the opposite limit.
         """
+        if speed_rpm is None:
+            speed_rpm = self._default_home_speed_rpm
         print(
             f"{'=' * 40}\n"
             f"HOMING (speed={speed_rpm} RPM, dir=0x{direction:02X})\n"
             f"{'=' * 40}"
         )
-        speed_bytes = self._int16_bytes(speed_rpm)
 
-        self._send(0x90, 0x00, direction, *speed_bytes, 0x00, 0x00)
-
-        self._send(0x91)
+        # Homing pass: limits disabled so the motor can roll onto the
+        # home switch without the firmware refusing the motion.
+        self._send(self.CMD_SET_HOME, *self._home_payload(
+            direction=direction, speed_rpm=speed_rpm, end_limit=False))
+        self._send(self.CMD_START_HOME)
         print("Moving toward origin switch...")
         status = self._wait()
 
-        if status == 0x02:
+        if status == self.STATUS_COMPLETE:
             print("Homing complete. Zero point set.")
-            self._send(0x90, 0x00, direction, *speed_bytes, 0x01, 0x00)
+            self._send(self.CMD_SET_HOME, *self._home_payload(
+                direction=direction, speed_rpm=speed_rpm, end_limit=True))
             print("Limit switches enabled.")
-
-            coord = int(
-                self._dummy_move_offset_mm / self._mm_per_turn * self._encoder_per_turn
-            )
-            dummy = (
-                self._int16_bytes(self._dummy_move_speed_rpm)
-                + [0]
-                + self._int24_bytes(coord)
-            )
-            self._send(0xF5, *dummy, silent=True)
-            time.sleep(self._limit_recover_delay_s)
-            self.dev.purge_rx_buffer()
-        elif status == 0x00:
+            # Motor sits exactly on the home switch (encoder=0). The
+            # next motion call (move_to / jog) will see _is_at_limit()
+            # is True and pre-send a sacrificial command to absorb
+            # the firmware's "first command after limit-stop" drop.
+        elif status == self.STATUS_FAILED:
             print("Homing FAILED. Check switch wiring.")
         else:
             print(f"Homing ended: {status}")
@@ -459,9 +665,13 @@ class MKSMotor:
     def move_to(self, mm, speed_pct=20, accel_pct=10):
         """Move to absolute position in mm.
 
-        Uses F5H coordinate-based absolute motion
-        (manual section 11.4). Ball screw converts
-        mm to encoder counts.
+        Uses F5H coordinate-based absolute motion (manual section
+        11.4). Ball screw converts mm to encoder counts.
+
+        If a limit switch is currently closed (typically right after
+        homing, or after a previous motion ended on a limit), the
+        first F5 would be dropped by firmware. We absorb that drop
+        by pre-sending an identical F5 — same pattern as _jog().
 
         Args:
             mm: Target position in millimeters.
@@ -477,9 +687,13 @@ class MKSMotor:
             f"  Moving to {mm}mm (speed={speed}RPM, accel={accel}, coord=0x{coord:06X})"
         )
 
-        initial = self._send(0xF5, *motion_data)
+        if self._is_at_limit():
+            # Burn the dropped-slot F5 so the real one below takes hold.
+            self._send(self.CMD_MOVE_TO, *motion_data, silent=True)
 
-        if initial == 0x01:
+        initial = self._send(self.CMD_MOVE_TO, *motion_data)
+
+        if initial == self.STATUS_RUNNING:
             return self._wait()
 
         if initial:
@@ -488,35 +702,7 @@ class MKSMotor:
             print("[ERROR] No response")
         return initial
 
-    def read_io_status(self):
-        """Read IO port status (0x34).
-
-        Returns:
-            Bit-packed byte with:
-              bit0 = IN_1 (home / left-limit)
-              bit1 = IN_2 (right-limit)
-              bit2 = OUT_1
-              bit3 = OUT_2
-            Or None if no response.
-
-            With our setup (homeTrig=0, "active low"), a bit value
-            of 0 means the corresponding switch is closed.
-        """
-        return self._send(0x34, silent=True)
-
-    def _is_at_limit(self):
-        """True if either limit switch is currently closed.
-
-        Used to decide whether the jog "first command dropped after
-        a limit stop" workaround is needed.
-        """
-        status = self.read_io_status()
-        if status is None:
-            return False
-        # bit0 = IN_1, bit1 = IN_2. Active low (0 = closed).
-        return (status & 0x01) == 0 or (status & 0x02) == 0
-
-    def jog(self, speed_rpm: int, cw: bool, accel: int = 50):
+    def _jog(self, speed_rpm: int, cw: bool, accel: int = 50):
         """Start or stop continuous speed-mode jog (F6H).
 
         speed_rpm=0 issues a soft stop regardless of cw.
@@ -542,12 +728,12 @@ class MKSMotor:
         """
         speed = self._clamp(speed_rpm, 0, self._max_speed_rpm)
         acc   = self._clamp(accel, 0, self._max_accel)
-        byte2 = (0x80 if cw else 0x00) | ((speed >> 8) & 0x0F)
+        byte2 = (self._jog_dir_bit if cw else 0x00) | ((speed >> 8) & 0x0F)
         byte3 = speed & 0xFF
         if speed > 0 and self._is_at_limit():
             # Burn the dropped-slot F6 so the real one below takes hold.
-            self._send(0xF6, byte2, byte3, acc, silent=True)
-        return self._send(0xF6, byte2, byte3, acc, silent=True)
+            self._send(self.CMD_JOG, byte2, byte3, acc, silent=True)
+        return self._send(self.CMD_JOG, byte2, byte3, acc, silent=True)
 
     # --- Sync helpers (multi-motor) ---
 
@@ -595,7 +781,7 @@ class MKSMotor:
         )
 
     @staticmethod
-    def jog_sync(motors, speed_rpm, cw, accel=50, barrier=None):
+    def _jog_sync(motors, speed_rpm, cw, accel=50, barrier=None):
         """Start or stop continuous jog on multiple motors in sync.
 
         speed_rpm=0 issues a soft stop on every motor in the list.
@@ -609,7 +795,7 @@ class MKSMotor:
         """
         MKSMotor._sync(
             motors,
-            lambda m: m.jog(speed_rpm, cw, accel),
+            lambda m: m._jog(speed_rpm, cw, accel),
             barrier,
         )
 
@@ -625,98 +811,69 @@ class MKSMotor:
         """
         MKSMotor._sync(motors, lambda m: m.home(direction=direction), barrier)
 
-    # --- Manual command ---
+    # --- High-level convenience for UI-driven control ---
 
-    def manual_send(self, cmd, *data):
-        """Send a raw CAN command to the motor.
+    @staticmethod
+    def jog_start(motors, positive, invert, speed_rpm, accel=0):
+        """Jog a group of motors in a user-facing direction.
 
-        For motion commands (e.g. 0xF5), waits for
-        completion automatically.
-
-        Args:
-            cmd: MKS command code in hex (e.g. 0xF5).
-            *data: Variable-length data bytes.
-
-        Returns:
-            Status byte from motor response.
-        """
-        if cmd in self._motion_cmds:
-            initial = self._send(cmd, *data)
-            if initial == 0x01:
-                return self._wait()
-            return initial
-        return self._send(cmd, *data)
-
-    # --- Motor control ---
-
-    def set_zero(self):
-        """Set current position as zero point.
-
-        Returns:
-            Status byte from motor response.
-        """
-        return self._send(0x92)
-
-    def enable(self):
-        """Enable motor (energize coils).
-
-        Returns:
-            Status byte from motor response.
-        """
-        return self._send(0xF3, 0x01)
-
-    def disable(self):
-        """Disable motor (de-energize coils).
-
-        Returns:
-            Status byte from motor response.
-        """
-        return self._send(0xF3, 0x00)
-
-    def read_status(self):
-        """Read motor status.
-
-        Returns:
-            Status byte from motor response.
-        """
-        return self._send(0xF1)
-
-    # --- Entry Point ---
-
-    @classmethod
-    def main(
-        cls,
-        mm,
-        speed_pct=20,
-        accel_pct=10,
-        port=0,
-        can_id=0x01,
-    ):
-        """Open, setup, home, move, and close.
-        It can be modified as user's purpose.
-
-        Single entry point for complete motor operation.
+        Translates the "+ / -" convention used by the UI / scripts
+        into the F6 CW/CCW bit, applying the per-axis `invert` flag
+        so wiring corrections live at the call site rather than in
+        the motion routine.
 
         Args:
-            mm: Target position in millimeters.
-            speed_pct: Speed as 0-100% of max RPM.
-            accel_pct: Acceleration as 0-100% of max.
-            port: FTDI device index (default 0).
-            can_id: CAN bus ID for this motor.
+            motors: List of MKSMotor instances to jog together.
+            positive: True for the user-facing "+" direction.
+            invert: True to flip the physical direction (axis-level
+                wiring correction).
+            speed_rpm: Jog speed in RPM.
+            accel: Jog acceleration (0-255).
         """
-        motor = None
+        cw = positive ^ invert
         try:
-            motor = cls.open(port=port, can_id=can_id)
-            motor.setup()
-            motor.home()
-            motor.move_to(mm, speed_pct, accel_pct)
-
+            MKSMotor._jog_sync(motors, speed_rpm, cw, accel)
         except Exception as e:
-            print(f"[ERROR] {e}")
-        finally:
-            if motor:
-                motor.close()
+            print(f"[WARN] jog_start failed: {e}")
 
+    @staticmethod
+    def jog_stop(motors, accel=0):
+        """Soft-stop a group of motors.
 
-if __name__ == "__main__":
-    MKSMotor.main(mm=100, speed_pct=25, accel_pct=10)
+        Args:
+            motors: List of MKSMotor instances to stop.
+            accel: Deceleration value (0-255). Higher = faster stop.
+        """
+        try:
+            MKSMotor._jog_sync(motors, 0, False, accel)
+        except Exception as e:
+            print(f"[WARN] jog_stop failed: {e}")
+
+    @staticmethod
+    def home_xz(z_motors, x_motor, home_dir_z=0x00, home_dir_x=0x01):
+        """Home the paired Z axis (in parallel) and then the X axis.
+
+        Project-specific helper for the current XZ stage topology.
+        Wraps each homing call in try/except so a single-motor failure
+        is logged without aborting the rest of the sequence.
+
+        Args:
+            z_motors: List of Z-axis MKSMotor instances (paired).
+            x_motor: X-axis MKSMotor instance.
+            home_dir_z: 0x90 direction byte for Z homing.
+            home_dir_x: 0x90 direction byte for X homing.
+        """
+        print("Homing Z motors...")
+        try:
+            MKSMotor.home_sync(z_motors, direction=home_dir_z)
+        except Exception as e:
+            print(f"[WARN] Z home failed: {e}")
+        print("Z homing complete.")
+
+        print("Homing X motor...")
+        try:
+            x_motor.home(direction=home_dir_x)
+        except Exception as e:
+            print(f"[WARN] X home failed: {e}")
+        print("X homing complete.")
+

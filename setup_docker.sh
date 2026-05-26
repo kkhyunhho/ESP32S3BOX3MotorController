@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # setup_docker.sh
 # Minimal ESP-IDF firmware build environment setup for inside a Docker
-# container. USB-related work (ftdi_sio unbind, device nodes, pip packages)
-# is handled on every run by launch_bridge.sh, not here.
+# container. USB-related work (ftdi_sio unbind, device nodes) is handled
+# on every run by bridge.py / CVMeasure.py themselves via the helpers in
+# mks_motor.py. Python deps (pyserial / pyftdi) install once per env via
+# `pip install -r requirements.txt`.
 #
 # Usage:  bash setup_docker.sh
 # After:  source ~/.espressif/v6.0.1/esp-idf/export.sh
@@ -91,13 +93,21 @@ ${C_BOLD}${C_GREEN}=============================================================
   ${C_BOLD}Convenience alias (optional, add to ~/.bashrc):${C_RESET}
      alias get_idf='source ${IDF_DIR}/export.sh'
 
+  ${C_BOLD}PC bridge (one-time Python dep install, per env):${C_RESET}
+     conda activate <your-env>          # or: source .venv/bin/activate
+     pip install -r requirements.txt    # pyserial + pyftdi
+
+  ${C_BOLD}PC bridge (every run):${C_RESET}
+     python3 bridge.py
+     python3 CVMeasure.py               # CV diagonal-stair measurement
+
   ${C_BOLD}${C_YELLOW}Note:${C_RESET}
      ${C_BOLD}Flashing firmware / running the bridge${C_RESET} only works when the
      container has USB passthrough configured. If it does:
      - idf.py -p /dev/ttyACM0 flash monitor
-     - ./launch_bridge.sh        (auto-installs pyserial/pyftdi, unbinds
-                                  ftdi_sio, repairs /dev/bus/usb nodes,
-                                  then runs bridge.py)
+     - python3 bridge.py
+     bridge.py rebuilds /dev/bus/usb nodes and detaches ftdi_sio on
+     every run, so no separate launcher is needed.
      For permanent host-side setup (udev rules, etc.) see SETUP_UBUNTU.md.
 
 EOF
