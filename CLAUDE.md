@@ -8,8 +8,15 @@ ESP-IDF firmware for the **ESP32-S3-BOX-3** dev board, paired with a PC-side
 Python bridge that drives **MKS SERVO57D** closed-loop stepper motors over CAN.
 
 Current motor configuration (bridge mode):
-- 2× Z-axis motors (CAN IDs `0x01`, `0x02`)
-- 1× X-axis motor  (CAN ID `0x03`)
+- 2× Z-axis motors (`Z_A`, `Z_B`; paired, always move together)
+- 1× X-axis motor (`X`)
+- Each motor is wired to its **own dedicated USB2CAN adapter**, so all
+  three motors keep the factory-default CAN ID `0x01` — there's no bus
+  sharing and therefore no need for distinct IDs.
+- Adapters are addressed by **FTDI chip serial number** (`SERIAL_X` in
+  [bridge.py](bridge.py) / [CVMeasure.py](CVMeasure.py)). Only the X
+  adapter needs an explicit serial; whichever two adapters remain are
+  treated as Z.
 - Y-axis: **planned, not yet implemented** — UI placeholder panel exists in
   `ui.c`, but neither `motor_cmd.h` nor `bridge.py` handles it yet.
 
@@ -29,16 +36,21 @@ The PC reads those commands and pushes CAN frames through USB2CAN adapters —
 ┌──────────────────────┐   USB    ┌──────────────────────┐  USB2CAN  ┌──────────────┐
 │  ESP32-S3-BOX-3      │ Serial   │  PC                  │ Adapter   │  MKS SERVO57D│
 │                      │ 115200   │                      │  ×3       │              │
-│  LVGL touch UI       │ ───────► │  bridge.py           │ ────────► │  Z_A (0x01)  │
-│  emits CMD:Z+\n etc. │          │  └─ mks_motor.py     │           │  Z_B (0x02)  │
-│                      │          │     (CAN protocol)   │           │  X   (0x03)  │
+│  LVGL touch UI       │ ───────► │  bridge.py           │ ────────► │  Z_A         │
+│  emits CMD:Z+\n etc. │          │  └─ mks_motor.py     │           │  Z_B         │
+│                      │          │     (CAN protocol)   │           │  X (SERIAL_X)│
 └──────────────────────┘          └──────────────────────┘           └──────────────┘
 ```
 
+Adapters are picked by FTDI chip serial — only X needs an explicit
+serial (`SERIAL_X` constant in [bridge.py](bridge.py)); the two Z
+adapters are auto-assigned from whatever remains.
+
 ## Common commands
 
-Run from the project root. Assumes ESP-IDF is sourced (`$env:IDF_PATH` set,
-`idf.py` on PATH).
+Run from the project root. Assumes ESP-IDF is sourced (`idf.py` on PATH).
+
+### Windows (PowerShell)
 
 ```powershell
 idf.py set-target esp32s3          # one-time after build/ is deleted
@@ -51,12 +63,37 @@ idf.py reconfigure                  # re-run CMake without wiping build/
 python bridge.py                    # start PC-side CAN bridge
 ```
 
-The firmware has no project-specific menuconfig options in bridge mode —
-jog speed / acceleration / direction inversion / motor port mapping all
-live at the top of [bridge.py](bridge.py) on the PC side.
+### Linux / Docker
 
-> `idf.py monitor` and `bridge.py` share the same COM port. Close the monitor
-> before running the bridge.
+```bash
+source /root/.espressif/v6.0.1/esp-idf/export.sh   # per terminal
+idf.py set-target esp32s3
+idf.py build
+idf.py -p /dev/ttyACM0 flash monitor
+python3 bridge.py                   # rebuilds USB nodes + runs bridge
+python3 CVMeasure.py                # CV diagonal-stair measurement run
+python3 CAN2USBAdapterDeviceRecognition.py   # list FTDI adapter serials
+```
+
+Per-env one-time Python dep install (after activating a conda env or
+venv):
+
+```bash
+pip install -r requirements.txt     # pyserial + pyftdi
+```
+
+`bridge.py` and `CVMeasure.py` call `prepare_usb_nodes()` /
+`release_ftdi_sio()` at startup, so `/dev/bus/usb` + `/dev/ttyACM*`
+node rebuild and `ftdi_sio` detach happen on every run without a
+separate launcher script.
+
+The firmware has no project-specific menuconfig options in bridge mode —
+jog speed / acceleration / direction inversion / homing direction /
+adapter serial all live at the top of [bridge.py](bridge.py) on the
+PC side.
+
+> `idf.py monitor` and `bridge.py` share the same serial port. Close
+> the monitor before running the bridge.
 
 ## Architecture
 
@@ -68,8 +105,22 @@ main/                       ESP32 firmware
 ├── ui.c / ui.h             LVGL touch UI (Z/X quadrant dial + Y placeholder)
 ├── motor_cmd.c / .h        Button event → ASCII command on stdout (USB serial)
 └── idf_component.yml       esp32_s3_box_3 BSP dependency
-bridge.py                   PC-side serial→CAN bridge
-mks_motor.py                MKS SERVO57D CAN protocol wrapper (PC side)
+bridge.py                   PC-side serial→CAN bridge (jog / home routing)
+mks_motor.py                MKS SERVO57D CAN library (pyftdi-based) +
+                            module helpers prepare_usb_nodes /
+                            release_ftdi_sio / open_xz
+CVMeasure.py                Stand-alone CV measurement run: 5-step
+                            diagonal stair via absolute moves
+CAN2USBAdapterDeviceRecognition.py
+                            Print connected FTDI adapter serials —
+                            run this to populate SERIAL_X
+launch_bridge.bat           Windows double-click launcher for bridge.py
+requirements.txt            Python deps for the bridge (pyserial + pyftdi);
+                            install once per env with `pip install -r ...`
+setup_docker.sh             First-time ESP-IDF install inside a build
+                            container (no USB / udev steps)
+SETUP_UBUNTU.md             Host-side notes (udev rule, dialout, USB hub
+                            tips) for the NUC
 sdkconfig.defaults          Board hardware defaults (PSRAM, flash, fonts)
 ToDo.md                     Task log (append-only)
 ```
@@ -122,29 +173,66 @@ output, etc.).
 
 ## PC bridge (`bridge.py` + `mks_motor.py`)
 
-The PC bridge owns all CAN communication. It opens one USB2CAN adapter per
-motor and drives them in parallel via Python threads. Per-axis direction
-inversion is controlled by the `Z_INVERT` / `X_INVERT` flags at the top of
-`bridge.py`.
+The PC bridge owns all CAN communication. It opens one USB2CAN adapter
+per motor and drives them in parallel via Python threads.
+
+Configuration lives at the top of [bridge.py](bridge.py):
+
+- `SERIAL_X` — FTDI chip serial of the X-axis adapter (the only one
+  that has to be explicitly named; Z adapters are auto-assigned).
+- `JOG_SPEED_RPM`, `JOG_ACCEL` — jog parameters
+- `Z_INVERT`, `X_INVERT` — direction-inversion flags applied at the
+  jog-handler level
+- `HOMING_ENABLED` — gate startup auto-homing while bringing up new
+  wiring
+- `HOME_DIR_Z`, `HOME_DIR_X` — direction byte for the 0x90 home
+  command per axis
+
+`mks_motor.py` also exposes two Docker-side helpers, called at the
+top of `bridge.py` / `CVMeasure.py`'s `main()`:
+
+- `prepare_usb_nodes()` — rebuild `/dev/bus/usb/<bus>/<dev>` and
+  `/dev/ttyACM*` from sysfs (container `/dev` is a private tmpfs).
+  Guarded against non-Linux hosts.
+- `release_ftdi_sio()` — detach the kernel's `ftdi_sio` so libusb-based
+  pyftdi can claim each adapter
+
+And a per-instance `coord_invert` attribute on `MKSMotor`: when True,
+`_mm_to_coord()` negates the resulting encoder count so F4/F5 absolute
+moves go in the physically correct direction on axes whose limit
+wiring was swapped (Z, in this project). `MKSMotor.open_xz()` sets
+`coord_invert=True` on both Z motors by default.
 
 ### MKS CAN protocol quick reference
 
 For people editing `mks_motor.py`. All multi-byte integers are **big-endian**.
 Checksum: `(can_id + cmd + sum(data_bytes)) & 0xFF`.
 
-| Command          | Code | Purpose                                          |
-|------------------|------|--------------------------------------------------|
-| Set working mode | 0x82 | `0x05` selects SR_vFOC (bus FOC)                 |
-| Set group CAN ID | 0x8D | Assign shared group ID (e.g. both Z motors)      |
-| Enable / disable | 0xF3 | `0x01` = enable (shaft lock), `0x00` = disable   |
-| Jog (speed mode) | 0xF6 | `[dir\|speed_hi][speed_lo][accel]`; speed=0 stop |
-| Emergency stop   | 0xF7 | Hard stop; not recommended above 1000 RPM        |
+| Command            | Code | Purpose / payload                                                   |
+|--------------------|------|---------------------------------------------------------------------|
+| Read IO ports      | 0x34 | Returns bit-packed IN_1 / IN_2 / OUT_1 / OUT_2 state                |
+| Set working mode   | 0x82 | `0x05` selects SR_vFOC (bus FOC)                                    |
+| Set slave response | 0x8C | `[01 01]` enables active response from the motor                    |
+| Set home params    | 0x90 | `[homeTrig][homeDir][speed_hi][speed_lo][EndLimit][hm_mode]`        |
+| Start home         | 0x91 | No payload; honors 0x90 settings                                    |
+| Set zero point     | 0x92 | Set current position as encoder zero                                |
+| Coord absolute move| 0xF5 | `[speed_hi][speed_lo][accel][coord_hi][coord_mid][coord_lo]`        |
+| Jog (speed mode)   | 0xF6 | `[dir\|speed_hi][speed_lo][accel]`; speed=0 = soft stop             |
+| Emergency stop     | 0xF7 | Hard stop; not recommended above 1000 RPM                           |
 
-F6h byte 2 encoding: bit 7 = direction (0=CCW, 1=CW), bits 3–0 = speed[11:8].
+F6 byte 2 encoding: bit 7 = direction (0=CCW per manual, 1=CW per
+manual — the wiring on this project inverts CW/CCW physically),
+bits 3–0 = `speed[11:8]`.
 
-Group / broadcast frames (CAN ID `0x00` or a group ID) generate **no response**
-from the motor. `bridge.py` instead fans out commands per-motor in parallel
-threads, so group IDs aren't used in the current implementation.
+**Not used in this project (but documented for reference):**
+
+- 0x86 (Set motor rotation direction): per manual, "only valid for
+  pulse interfaces — serial interface direction is determined by
+  the command". Don't try to use 0x86 to flip Z's absolute-coord
+  direction in SR_vFOC mode; use `coord_invert` instead.
+- 0x8D (group CAN ID): would only matter if motors shared a bus.
+  Each motor here has its own adapter, so commands fan out per-motor
+  through Python threads.
 
 CAN bus speed: **500 Kbps** (MKS SERVO57D factory default).
 
@@ -185,8 +273,10 @@ Declared in `main/idf_component.yml`:
 - `espressif/esp32_s3_box_3` — BSP (display, touch, I2C, LVGL task, backlight).
   Owns the LVGL rendering task on core 0.
 
-Python side ([bridge.py](bridge.py)) requires `pyserial` and whatever the
-USB2CAN adapter vendor's SDK exposes via `mks_motor.py`.
+Python side ([bridge.py](bridge.py) / [CVMeasure.py](CVMeasure.py))
+requires `pyserial` (ESP32 CDC link) and `pyftdi` (USB2CAN adapter
+access over libusb). Listed in [requirements.txt](requirements.txt);
+install once per env with `pip install -r requirements.txt`.
 
 Do **not** edit anything under `managed_components/` — regenerated from
 `dependencies.lock`.
@@ -199,8 +289,11 @@ When the Y-axis motor is added, the following touchpoints must change in lock-st
 - [main/motor_cmd.c](main/motor_cmd.c) — add `case AXIS_Y` to jog/stop.
 - [main/ui.c](main/ui.c) — wire the existing Y placeholder buttons to
   `motor_cmd_jog_start(AXIS_Y, …)`.
-- [bridge.py](bridge.py) — add a 4th `MKSMotor.open(port=PORT_Y)`, a `Y_INVERT`
-  flag, and `Y+` / `Y-` / `Y0` handlers; update `home_all` to include Y.
+- [bridge.py](bridge.py) — record the Y adapter's FTDI serial in a
+  `SERIAL_Y` constant, extend the adapter-enumeration logic (currently
+  `MKSMotor.open_xz` in `mks_motor.py`) to return four motors, add
+  `Y_INVERT` / `HOME_DIR_Y` / per-axis `coord_invert` flags as needed,
+  and wire `Y+` / `Y-` / `Y0` handlers; update `home_all` to include Y.
 - README and this file's motor table.
 
 ---
@@ -278,13 +371,18 @@ Additional rules:
 
 ## 3. Python Code Convention (PC bridge)
 
-`bridge.py` and `mks_motor.py` follow the global Python style:
-- Python 3.14+, 4-space indent, 80-column limit, ruff formatted.
+`bridge.py`, `mks_motor.py`, and `CVMeasure.py` follow the global Python
+style:
+- **Python 3.10+** is the supported floor (no walrus-only-3.8 / `match`
+  is fine, but nothing fancier is required). Tested on Python 3.11
+  (conda env `lh`) and 3.14. The ESP-IDF bundled venv is also 3.11.
+- 4-space indent, 80-column limit, ruff formatted.
 - `snake_case` for functions/variables, `CamelCase` for classes.
-- Google-style docstrings on public functions/classes (`Args:`, `Returns:`,
-  `Raises:`).
+- Google-style docstrings on public functions/classes (`Args:`,
+  `Returns:`, `Raises:`).
 - No magic numbers — use module-level constants (see `JOG_SPEED_RPM`,
-  `JOG_ACCEL` at top of `bridge.py`).
+  `JOG_ACCEL`, `SERIAL_X`, `HOME_DIR_Z`, etc. at the top of `bridge.py`
+  / `CVMeasure.py`).
 
 ---
 
@@ -318,6 +416,13 @@ For every non-trivial task:
    ```
 3. Check items off (`- [x]`) as work completes; append a one-line summary.
 4. Commit after each completed command when working in a git repo.
+5. **Auto-push**: a Stop hook in [.claude/settings.json](.claude/settings.json)
+   runs [.claude/auto-push.sh](.claude/auto-push.sh) at the end of every
+   Claude turn. When the current branch is 5+ commits ahead of its
+   upstream, the script issues `git push` and prints a one-line
+   `[auto-push]` notice (success or failure). Threshold can be tuned
+   by editing `THRESHOLD` in the script. To disable entirely, remove
+   the hook from `settings.json`.
 
 ---
 
@@ -350,11 +455,33 @@ Known traps in this project:
 - ESP32 firmware does **not** speak CAN in bridge mode. If a future change
   reintroduces direct-CAN on the ESP32, update the architecture diagram and
   the "ESP32 firmware does not speak CAN" notes throughout this file.
-- `bridge.py` and `idf.py monitor` cannot both hold the same COM port. Always
+- `bridge.py` and `idf.py monitor` cannot both hold the same port. Always
   close the monitor before starting the bridge.
 - Y axis is reserved but not implemented. Don't add `CMD:Y*` handling on one
   side without the matching change on the other side (see "Planned: Y-axis
   addition" above).
+- **MKS firmware drops the first motion command (F4/F5/F6) sent while a
+  limit switch is closed.** Every motion entry-point in `mks_motor.py`
+  checks `_is_at_limit()` first and pre-sends a sacrificial copy of the
+  command to absorb the drop. Bypassing this via `_send` directly will
+  reproduce the bug.
+- **Z-axis uses `coord_invert=True`.** The Z limit wires were physically
+  swapped to move "home" to the opposite end of travel, which inverted
+  the meaning of "positive coord" for F5 absolute moves on Z only. The
+  inversion is handled by `_mm_to_coord()` so callers still pass
+  non-negative mm. F6 jog is **not** affected — Z+ / Z- jog handler
+  semantics stay as the user defined.
+- **0x86 (Set motor rotation direction) does not work in SR_vFOC mode.**
+  The MKS manual notes it's pulse-interface only. Use `coord_invert`
+  instead of trying to flip motor direction via 0x86.
+- **Docker container's `/dev` is a private tmpfs.** Host USB hotplug
+  events don't propagate, so adapter / ESP32 device nodes go stale
+  after every USB re-enumeration. `bridge.py` / `CVMeasure.py` call
+  `prepare_usb_nodes()` at startup to rebuild them from sysfs.
+- **`ftdi_sio` claims FTDI adapters on every enumeration.** pyftdi
+  needs them unbound; `release_ftdi_sio()` (also at the top of
+  `bridge.py` / `CVMeasure.py`) handles this. A host-side udev rule
+  is the permanent fix — see [SETUP_UBUNTU.md](SETUP_UBUNTU.md).
 
 ---
 

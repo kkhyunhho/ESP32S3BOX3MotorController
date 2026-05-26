@@ -38,7 +38,7 @@ follow in the sections below.
 | Per-terminal IDF activation | `$env:IDF_PATH` set by installer | `source <IDF_DIR>/export.sh` |
 | Firmware build / flash | `idf.py -p COM<N> flash monitor` | `idf.py -p /dev/ttyACM0 flash monitor` |
 | List USB2CAN ports | `python CAN2USBAdapterDeviceRecognition.py` (D2XX) | `pyftdi` one-liner — see "Verify USB2CAN" below |
-| Run PC bridge | `launch_bridge.bat` (double-click) | `./launch_bridge.sh` |
+| Run PC bridge | `launch_bridge.bat` (double-click) | `python3 bridge.py` (after `pip install -r requirements.txt`) |
 | FTDI driver / permission fix | (handled by D2XX driver) | host udev rule — see [SETUP_UBUNTU.md](SETUP_UBUNTU.md) |
 
 ## Build / Flash
@@ -139,27 +139,32 @@ To put it on the desktop: right-click [launch_bridge.bat](launch_bridge.bat)
 
 **Linux / Docker:**
 
+One-time per Python env (conda env or venv), install the bridge deps:
+
 ```bash
-./launch_bridge.sh
+pip install -r requirements.txt   # pyserial + pyftdi
 ```
 
-[launch_bridge.sh](launch_bridge.sh) handles the Linux-specific chores
-automatically on every run:
-1. Creates / activates a project-local `.venv` when the active Python
-   isn't isolated (system Python is PEP 668-managed on Ubuntu 23.04+)
-2. Installs `pyserial` / `pyftdi` into the active env if missing
-3. Rebuilds stale device nodes from sysfs — both
-   `/dev/bus/usb/<bus>/<dev>` (FTDI adapters) and `/dev/ttyACM*` (the
-   ESP32 CDC serial) — because the container's `/dev` is its own
-   tmpfs and doesn't receive host USB hotplug events
-4. Detaches `ftdi_sio` from every FTDI interface so `pyftdi` can enumerate
-   cleanly (the host kernel auto-binds `ftdi_sio` to FTDI devices on every
-   USB enumeration)
-5. Runs `python3 bridge.py`
+Then every run:
 
-A host-level udev rule on the NUC can eliminate steps 3 and 4 permanently —
-see [SETUP_UBUNTU.md](SETUP_UBUNTU.md) for the rule. Without it, run
-`./launch_bridge.sh` every time and it stays self-healing.
+```bash
+python3 bridge.py
+```
+
+`bridge.py` (and `CVMeasure.py`) call `prepare_usb_nodes()` and
+`release_ftdi_sio()` at startup, so each run automatically:
+
+1. Rebuilds stale device nodes from sysfs — `/dev/bus/usb/<bus>/<dev>`
+   (FTDI adapters) and `/dev/ttyACM*` (ESP32 CDC serial) — because the
+   container's `/dev` is its own tmpfs and doesn't receive host USB
+   hotplug events.
+2. Detaches `ftdi_sio` from every FTDI interface so `pyftdi` can
+   enumerate cleanly (the host kernel auto-binds `ftdi_sio` to FTDI
+   devices on every USB enumeration).
+
+A host-level udev rule on the NUC can eliminate step 2 permanently —
+see [SETUP_UBUNTU.md](SETUP_UBUNTU.md) for the rule. Without it the
+in-process detach above keeps things working.
 
 #### Before launching (every time)
 
@@ -202,8 +207,8 @@ motor_controller/
 ├── CAN2USBAdapterDeviceRecognition.py
 │                          USB2CAN adapter port-number probe (Windows / D2XX)
 ├── launch_bridge.bat      Windows: double-click launcher for bridge.py
-├── launch_bridge.sh       Linux/Docker: launcher with auto USB-node /
-│                          ftdi_sio / pip-deps recovery
+├── requirements.txt       Python deps for the bridge (pyserial + pyftdi);
+│                          `pip install -r requirements.txt` once per env
 ├── setup_docker.sh        Linux: minimal ESP-IDF setup inside a build container
 ├── SETUP_UBUNTU.md        Linux host setup notes (udev rule, dialout)
 ├── sdkconfig.defaults     BOX-3 hardware defaults (PSRAM, flash, fonts)
@@ -262,21 +267,18 @@ Any other line from the ESP32 is silently ignored by `bridge.py`.
   wiring, or termination — not software.
 
 ### Linux / Docker specific
-- **`ftd2xx.DeviceError: DEVICE_NOT_FOUND`**: D2XX (libftd2xx) doesn't
-  enumerate reliably inside containers. The project uses `pyftdi` (libusb)
-  on Linux; this error only appears if you run the Windows-only
-  `CAN2USBAdapterDeviceRecognition.py` here.
+- **`ModuleNotFoundError: No module named 'serial'` / `pyftdi`**: the
+  active Python env doesn't have the deps yet. Activate your conda env
+  / venv and run `pip install -r requirements.txt` once.
 - **`usb.core.USBError: [Errno 19] No such device`** during
-  `MKSMotor.open`: container `/dev/bus/usb/<bus>/<dev>` is stale — the
-  USB device got a new address but the container kept the old node.
-  [launch_bridge.sh](launch_bridge.sh) rebuilds these from sysfs on every
-  run; if you bypass the launcher you may hit this.
+  `MKSMotor.open`: container `/dev/bus/usb/<bus>/<dev>` is stale.
+  `bridge.py` and `CVMeasure.py` rebuild these at startup via
+  `prepare_usb_nodes()` — if you wrote your own driver script, call
+  that helper from `mks_motor.py` too.
 - **`The device has no langid`**: same root cause as above (stale
   `/dev/bus/usb` nodes) — `libusb_get_string` can't talk to a device
   whose node doesn't exist anymore.
-- **`ftdi.open` fails after enumeration succeeds**: `ftdi_sio` rebound to
-  the adapter between unbind and open. Either run via
-  [launch_bridge.sh](launch_bridge.sh) (which unbinds right before
-  opening) or install the host udev rule from
-  [SETUP_UBUNTU.md](SETUP_UBUNTU.md) to prevent `ftdi_sio` from claiming
-  these adapters in the first place.
+- **`ftdi.open` fails after enumeration succeeds**: `ftdi_sio` rebound
+  to the adapter between unbind and open. `release_ftdi_sio()` runs
+  at script startup, but a host-level udev rule (see
+  [SETUP_UBUNTU.md](SETUP_UBUNTU.md)) is the permanent fix.

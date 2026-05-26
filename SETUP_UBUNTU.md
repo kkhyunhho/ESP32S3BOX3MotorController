@@ -1,9 +1,10 @@
 # Ubuntu (NUC) host — one-time setup notes
 
 This document covers items that need to be applied **once on the NUC host**.
-Everything inside the container is handled automatically by
-[setup_docker.sh](setup_docker.sh) and [launch_bridge.sh](launch_bridge.sh),
-so we don't repeat that here.
+Container-side setup is handled by [setup_docker.sh](setup_docker.sh)
+(ESP-IDF install) and `pip install -r requirements.txt` (Python deps);
+USB-node / `ftdi_sio` recovery happens in-process when `bridge.py` /
+`CVMeasure.py` start, so no separate launcher script is needed.
 
 If you don't have shell access to the host, you only need to forward § 1
 (the udev rule) to whoever administers the NUC.
@@ -30,7 +31,8 @@ sudo udevadm trigger
 ```
 
 After the rule is in place:
-- the unbind loop inside `launch_bridge.sh` becomes a no-op (already unbound)
+- the `release_ftdi_sio()` call at the top of `bridge.py` / `CVMeasure.py`
+  becomes a no-op (already unbound)
 - the wedge race condition we hit from frequent plug/unplug disappears
 
 > The rule only matches VID:PID `0403:6001` (FT232R, used by these USB2CAN
@@ -73,4 +75,4 @@ This is irrelevant inside the container — root already has the access.
 | `Permission denied: '/dev/ttyACM0'` (host shell) | Join the dialout group — see § 2 |
 | `lsusb` shows FTDI but bridge fails | udev rule not yet applied — see § 1 |
 | Adapters wedge after rapid plug/unplug | Power-cycle the whole USB hub (unplug ≥ 10 s) |
-| `no langid` or `Errno 19` inside the container | Run via `launch_bridge.sh` — it rebuilds the stale `/dev/bus/usb` nodes |
+| `no langid` or `Errno 19` inside the container | Run `python3 bridge.py` / `python3 CVMeasure.py` — they rebuild stale `/dev/bus/usb` nodes at startup |
