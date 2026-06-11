@@ -218,7 +218,7 @@ Checksum: `(can_id + cmd + sum(data_bytes)) & 0xFF`.
 | Set zero point     | 0x92 | Set current position as encoder zero                                |
 | Coord absolute move| 0xF5 | `[speed_hi][speed_lo][accel][coord_hi][coord_mid][coord_lo]`        |
 | Jog (speed mode)   | 0xF6 | `[dir\|speed_hi][speed_lo][accel]`; speed=0 = soft stop             |
-| Emergency stop     | 0xF7 | Hard stop; not recommended above 1000 RPM                           |
+| Emergency stop     | 0xF7 | Hard stop (`emergency_stop()`); the interlock's group-stop primitive |
 
 F6 byte 2 encoding: bit 7 = direction (0=CCW per manual, 1=CW per
 manual — the wiring on this project inverts CW/CCW physically),
@@ -474,6 +474,28 @@ Known traps in this project:
 - **0x86 (Set motor rotation direction) does not work in SR_vFOC mode.**
   The MKS manual notes it's pulse-interface only. Use `coord_invert`
   instead of trying to flip motor direction via 0x86.
+- **Paired Z motors must never desync.** `Z_A` and `Z_B` are
+  mechanically coupled; if one motor's CAN link faults while the other
+  keeps moving, the gantry racks and the mechanism is damaged. The
+  group helpers (`jog_start` / `jog_stop` / `move_sync`) enforce a
+  safety interlock: any motor raising during the operation triggers
+  `stop_group_hard()`, which fires `emergency_stop()` (F7) at every
+  motor in the group and retries through transient `ConnectionError`s.
+  If a motor stays unreachable, `stop_group_hard` returns False and logs
+  a CUT POWER warning — at that point only a hardware e-stop can help.
+  Don't drive paired motors through `_sync` (it swallows per-thread
+  exceptions); use the group helpers. Logic is covered offline by
+  `claude_test/test_group_interlock.py`.
+- **Any CAN fault aborts the bridge (fail-safe).** The group helpers
+  call `mks_motor.set_group_fault_hook`'s callback after stopping the
+  group. `bridge.py` registers `emergency_shutdown`, which hard-stops
+  EVERY axis and then `os._exit`s. Rationale: a motor left jogging does
+  not stop just because the process dies, so the stop must happen before
+  the exit, and a comms fault means we can no longer trust coordinated
+  motion — restart is required to resume. This is intentionally
+  aggressive: even a transient blip terminates the bridge. To soften it
+  (e.g. tolerate N consecutive errors), change `emergency_shutdown` /
+  the hook call sites rather than removing the interlock.
 - **Docker container's `/dev` is a private tmpfs.** Host USB hotplug
   events don't propagate, so adapter / ESP32 device nodes go stale
   after every USB re-enumeration. `bridge.py` / `CVMeasure.py` call

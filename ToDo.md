@@ -262,3 +262,126 @@ Format:
 - [ ] (Follow-up) Show the ESP32's IP on the LCD via a small status
       label so the user doesn't need the DHCP table — out of scope
       for this MVP
+
+## 2026-05-29 | Add a FastAPI control plane to bridge.py
+- [x] Add `fastapi` + `uvicorn` to `requirements.txt`
+- [x] Refactor `bridge.py`: lift motor handles to module-level + add
+      a `threading.Lock` so TCP and HTTP commands cannot interleave
+- [x] Extract locked primitives (`jog_z`, `jog_x`, `stop_*`,
+      `home_all`, `move_to`) used by both transports
+- [x] Define FastAPI app with endpoints `/health`, `/jog/{axis}/{dir}`,
+      `/stop`, `/home`, `/move` (body = `{x_mm, z_mm}`), and CORS
+      wide-open (LAN-only tool); Swagger UI at `/docs`
+- [x] Launch uvicorn from a daemon thread with
+      `install_signal_handlers` monkey-patched away (main thread
+      keeps the SIGINT handler for the TCP loop)
+- [ ] In the active Python env:
+      `pip install -r requirements.txt` (picks up fastapi + uvicorn)
+- [ ] `python3 bridge.py` → smoke-test both transports:
+      `curl -X POST http://<nuc-ip>:8000/jog/z/positive` (briefly),
+      then `curl -X POST http://<nuc-ip>:8000/jog/z/stop`, then
+      confirm the ESP32 touch UI still works in parallel
+
+## 2026-06-10 | Implement stall protection in mks_motor.py
+- [x] Add opcodes 0x88 (overcurrent), 0x9D (position out-of-tolerance),
+      0x3E (read stall), 0x3D (release stall) + STALL_DETECTED status
+- [x] Add tuning constants (_encoder_err_per_rev, _stall_time_unit_ms,
+      _default_stall_time_ms, _default_stall_err_deg) — no magic numbers
+- [x] Add _ms_to_time_units / _deg_to_error_count conversions; verified
+      against manual worked example (01 9D 01 00 14 36 B0 99) byte-for-byte
+- [x] Methods: set_overcurrent_protection, set_position_error_protection,
+      enable/disable_stall_protection, is_stalled, release_stall
+- [x] Extract _retry_setting helper; refactor setup() to use it
+- [x] Sync helpers: enable_stall_protection_sync, release_stall_sync
+- [x] Update CLAUDE.md CAN protocol table + stall-protection note
+- [ ] Wire into bridge.py setup loop (call enable_stall_protection per
+      motor) once Z holding-vs-unlock behavior is confirmed on hardware
+- [ ] Verify on hardware: jam a motor, confirm is_stalled()==True and
+      release_stall() re-locks; tune error_deg/time_ms if it false-trips
+- [x] Add hardware test claude_test/test_stall_protection.py (X axis:
+      slow jog + live 0x3E poll; disables 0x8C active response so polls
+      read cleanly; arms limits + time budget for safety)
+- [ ] Run claude_test/test_stall_protection.py on hardware: block X by
+      hand, confirm [PASS] (is_stalled()==True) and release_stall()
+      re-locks; tune STALL_ERROR_DEG/STALL_TIME_MS if it false-trips
+
+## 2026-06-10 | Paired-Z safety interlock (stop both on one-side fault)
+- [x] Add CMD_ESTOP (0xF7) + MKSMotor.emergency_stop() hard-stop method
+- [x] Add _run_group() — parallel run that CAPTURES per-thread exceptions
+      (vs _sync which swallowed them, the root cause of Z desync)
+- [x] Add stop_group_hard() — F7 every motor, retry transient errors,
+      return False + CUT POWER warning if a motor stays unreachable
+- [x] Wire interlock into jog_start / jog_stop / move_sync (any motor
+      fault -> emergency-stop the whole group). bridge.py unchanged —
+      its jog_z/stop_z/move_to already route through these helpers
+- [x] Remove now-unused _jog_sync
+- [x] Offline test claude_test/test_group_interlock.py — 5/5 PASS
+- [x] Document invariant in CLAUDE.md "Known traps"
+- [ ] Hardware check: during a Z jog, pull one USB2CAN adapter; confirm
+      the partner Z motor also stops (not racks). Repeat for stop + move
+- [ ] Consider: enable Z stall protection too (extra hardware-side net),
+      and/or heartbeat protection (5.2.15) so a dead link self-stops
+
+## 2026-06-10 | Abort bridge.py on any CAN ConnectionError (fail-safe)
+- [x] Clarify behavior: jog motor does NOT self-stop on comms loss, and
+      killing bridge.py alone does NOT stop a jogging motor -> must
+      hard-stop motors BEFORE exiting
+- [x] mks_motor: add set_group_fault_hook() / _fire_group_fault(); fire
+      from jog_start / jog_stop / move_sync after the group e-stop
+- [x] bridge.py: emergency_shutdown() = stop_group_hard(all) then
+      os._exit(1); registered as the fault hook in main()
+- [x] Route X move through move_sync too so an X fault also aborts
+- [x] Offline test: hook fires once-with-reason on fault, never on the
+      healthy path (claude_test/test_group_interlock.py, 6/6 PASS)
+- [x] Document fail-safe abort policy in CLAUDE.md "Known traps"
+- [ ] Hardware check: jog Z, pull one USB2CAN -> expect both Z motors
+      stop (F7) then "[FATAL] ... terminated" and process exits
+- [ ] Decide if a transient-blip tolerance (N consecutive errors) is
+      wanted; current policy aborts on the very first ConnectionError
+
+## 2026-06-10 | Fix: homing was NOT covered by the interlock (real incident)
+- [x] Root cause: home_sync used _sync (swallows per-thread exceptions),
+      so a START_HOME ConnectionError on one Z left it stationary while
+      the partner homed -> rack. jog/move were covered; homing was not.
+- [x] home_sync now uses _run_group + stop_group_hard + _fire_group_fault
+- [x] home_xz routes X homing through home_sync too (single-motor group)
+- [x] Regression test test_home_fault_stops_group_and_fires_hook (7/7)
+- [ ] Investigate WHY the ConnectionError happens during homing (HW):
+      cabling/connector seating, USB hub power, ftdi_sio re-bind, CAN
+      termination (60Ohm), or EMI from motor current during homing motion
+- [ ] Jog-during-pull cannot be caught in software (no command sent while
+      held -> no detection; and a pulled adapter can't receive F7).
+      Heartbeat protection (5.2.15, motor-side) is the only real fix for
+      that case if desired later.
+
+## 2026-06-10 | Decision: keep only ConnectionError->stop-all+exit; remove stall protection
+- [x] Confirmed final policy = any CAN ConnectionError during motion ->
+      stop ALL motors (F7) + terminate bridge.py (already implemented via
+      interlock + emergency_shutdown). No other fault logic.
+- [x] Heartbeat (5.2.15) rejected: would kill legitimate long moves.
+- [x] Stall protection (5.4) rejected: tested at max sensitivity, motor
+      torque too strong to trip reliably -> ineffective.
+- [x] Removed all stall-protection code from mks_motor.py (opcodes 3D/3E/
+      88/9D, STALL_DETECTED, stall constants, _ms_to_time_units/
+      _deg_to_error_count, set_overcurrent/position_error_protection,
+      enable/disable_stall_protection, is_stalled, release_stall,
+      enable_stall_protection_sync, release_stall_sync).
+- [x] Deleted claude_test/test_stall_protection.py; updated README +
+      CLAUDE.md. Kept emergency_stop (F7) + _retry_setting (used by setup).
+- [x] Interlock regression still 7/7 PASS.
+
+## 2026-06-10 | Fix: absolute (F5) move interlock fired too late
+- [x] Gap found by user: move_to blocks in _wait() until target reached,
+      and _run_group only reacted AFTER joining all workers — so on an F5
+      fault the healthy Z motor could finish its whole move (racking)
+      before the interlock fired. jog was fine (fire-and-forget, no wait).
+- [x] Added _run_group(on_first_error=...) — fires the instant the FIRST
+      worker raises, from that worker thread, before partners return.
+- [x] Added _group_fault_handler(motors, kind); jog_start/jog_stop/
+      move_sync/home_sync now stop the group + fire the hook immediately
+      (bridge.py hook -> os._exit interrupts the partner's _wait).
+- [x] Regression test test_absolute_move_stops_partner_mid_move proves
+      the partner is halted MID-move (fails under old after-join code).
+- [x] Full suite 8/8 PASS.
+- [ ] Caveat unchanged: a fully dead link can't receive F7, so that one
+      motor still can't be software-stopped (hardware e-stop only).

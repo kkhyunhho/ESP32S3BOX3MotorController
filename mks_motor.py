@@ -98,6 +98,34 @@ def release_ftdi_sio():
             pass
 
 
+# Application-supplied callback fired when a paired-group operation cannot
+# be applied to every motor (e.g. a CAN link dropped mid-jog/move). The
+# group is emergency-stopped BEFORE this fires; the hook lets the
+# application decide what to do next — typically stop every axis and
+# abort. The motor library never terminates the process itself. None =
+# no-op. Set via set_group_fault_hook().
+_GROUP_FAULT_HOOK = None
+
+
+def set_group_fault_hook(fn):
+    """Register a callback invoked on an unrecoverable paired-group fault.
+
+    Args:
+        fn: Callable taking a single reason string, or None to clear it.
+            Fired AFTER the faulting group has been emergency-stopped,
+            from whichever thread detected the fault.
+    """
+    global _GROUP_FAULT_HOOK
+    _GROUP_FAULT_HOOK = fn
+
+
+def _fire_group_fault(reason):
+    """Invoke the registered group-fault hook if one is set."""
+    hook = _GROUP_FAULT_HOOK
+    if hook is not None:
+        hook(reason)
+
+
 class MKSMotor:
     """Controls MKS SERVO57D via USB2CAN-FIFO adapter."""
 
@@ -136,13 +164,14 @@ class MKSMotor:
     # dropped slot. No physical dummy motion required.
 
     # MKS command opcodes used by this file.
-    CMD_READ_IO     = 0x34   # read IN_1/IN_2/OUT_1/OUT_2 state
-    CMD_SET_MODE    = 0x82   # 0x05 selects SR_vFOC
-    CMD_SLAVE_RESP  = 0x8C   # enable active response from the motor
-    CMD_SET_HOME    = 0x90   # set homing parameters
-    CMD_START_HOME  = 0x91   # execute homing (uses last 0x90 settings)
-    CMD_MOVE_TO     = 0xF5   # absolute-coord motion
-    CMD_JOG         = 0xF6   # speed-mode jog
+    CMD_READ_IO         = 0x34   # read IN_1/IN_2/OUT_1/OUT_2 state
+    CMD_SET_MODE        = 0x82   # 0x05 selects SR_vFOC
+    CMD_SLAVE_RESP      = 0x8C   # enable active response from the motor
+    CMD_SET_HOME        = 0x90   # set homing parameters
+    CMD_START_HOME      = 0x91   # execute homing (uses last 0x90 settings)
+    CMD_MOVE_TO         = 0xF5   # absolute-coord motion
+    CMD_JOG             = 0xF6   # speed-mode jog
+    CMD_ESTOP           = 0xF7   # emergency stop (hard, no decel ramp)
 
     # Status bytes returned by the motor. The labels live in the
     # _motion_status / _setting_status dicts below for pretty-print;
@@ -524,6 +553,27 @@ class MKSMotor:
 
     # --- Setup & Homing ---
 
+    def _retry_setting(self, action):
+        """Run a setting action, retrying the MKS first-command drop.
+
+        MKS firmware occasionally ignores the first command after a
+        fresh CAN connection. Retries up to ``_setup_retry_count`` times.
+
+        Args:
+            action: Zero-arg callable returning True on success. A CAN
+                timeout (ConnectionError) counts as a failed attempt.
+
+        Returns:
+            True if any attempt succeeded.
+        """
+        for _ in range(self._setup_retry_count):
+            try:
+                if action():
+                    return True
+            except ConnectionError:
+                pass
+        return False
+
     def setup(self):
         """Apply default motor settings.
 
@@ -537,19 +587,13 @@ class MKSMotor:
             (self.CMD_SET_MODE,   [0x05]),         # 0x05 = SR_vFOC
             (self.CMD_SLAVE_RESP, [0x01, 0x01]),   # enable active response
         ]
+        # Each command is retried because MKS firmware occasionally drops
+        # the first command after a fresh CAN connection.
         ok = True
-        # Retry each command up to _setup_retry_count times: MKS firmware
-        # occasionally drops the first command after a fresh CAN connection.
         for cmd, data in commands:
-            success = False
-            for _ in range(self._setup_retry_count):
-                try:
-                    if self._send(cmd, *data, silent=True) == self.STATUS_SUCCESS:
-                        success = True
-                        break
-                except ConnectionError:
-                    pass
-            if not success:
+            if not self._retry_setting(
+                    lambda c=cmd, d=data:
+                    self._send(c, *d, silent=True) == self.STATUS_SUCCESS):
                 ok = False
 
         if ok:
@@ -735,6 +779,23 @@ class MKSMotor:
             self._send(self.CMD_JOG, byte2, byte3, acc, silent=True)
         return self._send(self.CMD_JOG, byte2, byte3, acc, silent=True)
 
+    def emergency_stop(self):
+        """Hard-stop the motor immediately via F7 (manual 9.2.3).
+
+        Skips the deceleration ramp that a soft jog-stop (F6 speed=0)
+        uses, so this is the fastest way to halt a runaway motor. Used as
+        the fallback in the paired-group safety interlock — see
+        stop_group_hard.
+
+        Returns:
+            Status byte from the motor (STATUS_SUCCESS on success), or
+            None for a broadcast ID.
+
+        Raises:
+            ConnectionError: If the motor does not respond after retries.
+        """
+        return self._send(self.CMD_ESTOP, silent=True)
+
     # --- Sync helpers (multi-motor) ---
 
     @staticmethod
@@ -765,51 +826,165 @@ class MKSMotor:
             t.join()
 
     @staticmethod
+    def _run_group(motors, action, synced=False, on_first_error=None):
+        """Run action(motor) on every motor in parallel, capturing errors.
+
+        Unlike _sync, a failure in one worker thread does NOT vanish: the
+        exception is recorded and returned so the caller can react (e.g.
+        stop the whole paired group). This is the basis of the safety
+        interlock — on a paired axis, one motor faulting must never leave
+        its partner moving alone.
+
+        Args:
+            motors: List of MKSMotor instances.
+            action: Callable taking a single MKSMotor argument.
+            synced: When True (and more than one motor), all workers wait
+                at a barrier before running action() so motion starts at
+                the same instant. Leave False for stops, where each motor
+                should halt as soon as possible without waiting for its
+                partner's thread.
+            on_first_error: Optional callable(index, exception) invoked
+                from the worker thread the INSTANT the first worker raises
+                — before the other workers return. This is what lets the
+                interlock stop a still-running paired motor MID-move: an
+                absolute (F5) move blocks in _wait() until it reaches its
+                target, so reacting only after the join would fire the
+                interlock too late (the healthy motor would finish its
+                move first). Fired at most once per call.
+
+        Returns:
+            List of exceptions aligned with ``motors`` — None for each
+            motor whose action ran without raising.
+        """
+        barrier = (threading.Barrier(len(motors))
+                   if synced and len(motors) > 1 else None)
+        errors = [None] * len(motors)
+        fire_lock = threading.Lock()
+        fired = [False]
+
+        def worker(i, m):
+            try:
+                if barrier is not None:
+                    barrier.wait()
+                action(m)
+            except Exception as e:  # capture so the joiner can react
+                errors[i] = e
+                if on_first_error is None:
+                    return
+                with fire_lock:
+                    first = not fired[0]
+                    fired[0] = True
+                if first:
+                    on_first_error(i, e)
+
+        threads = [
+            threading.Thread(target=worker, args=(i, m))
+            for i, m in enumerate(motors)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        return errors
+
+    @staticmethod
+    def _group_fault_handler(motors, kind):
+        """Build an on_first_error handler that trips the interlock now.
+
+        Stops every motor in the group (hard, retried) and fires the
+        group-fault hook the instant one motor faults — without waiting
+        for a partner's blocking move/home to finish.
+
+        Args:
+            motors: The group to stop.
+            kind: Short label for the fault reason ("move", "home", ...).
+
+        Returns:
+            A callable(index, exception) suitable for _run_group's
+            ``on_first_error``.
+        """
+        def handler(index, exc):
+            print(f"[SAFETY] {kind} fault on a motor ({exc}) — emergency-"
+                  f"stopping the group")
+            MKSMotor.stop_group_hard(motors)
+            _fire_group_fault(f"{kind}: a motor did not respond")
+        return handler
+
+    @staticmethod
+    def stop_group_hard(motors, attempts=3):
+        """Emergency-stop (F7) every motor, retrying any that error.
+
+        Safety interlock primitive: if one motor in a paired axis faults,
+        the others must not keep moving. Stops are fired in parallel with
+        no barrier so a still-moving motor is halted as fast as possible,
+        and any motor that errors (e.g. a transient ConnectionError on a
+        flaky USB2CAN link) is retried across ``attempts`` rounds.
+
+        Args:
+            motors: List of MKSMotor instances to halt together.
+            attempts: Max rounds to retry motors that did not respond.
+
+        Returns:
+            True if every motor acknowledged a stop within the attempts;
+            False if at least one stayed unreachable (caller should treat
+            this as a hardware-level emergency — software cannot stop it).
+        """
+        pending = list(motors)
+        for _ in range(attempts):
+            if not pending:
+                break
+            errors = MKSMotor._run_group(
+                pending, lambda m: m.emergency_stop())
+            pending = [m for m, e in zip(pending, errors) if e is not None]
+        if pending:
+            print(f"[SAFETY] {len(pending)} motor(s) did NOT confirm an "
+                  f"emergency stop — CUT POWER if a paired axis is racking.")
+        return not pending
+
+    @staticmethod
     def move_sync(motors, moves, barrier=None):
         """Run the same move sequence on multiple motors in sync.
+
+        Safety interlock: if any motor's move raises (e.g. a CAN
+        ConnectionError mid-move), every motor in the group is
+        emergency-stopped so a paired axis cannot have one side moving
+        while the other has faulted.
 
         Args:
             motors: List of MKSMotor instances to move together.
             moves: List of argument tuples passed to move_to()
                 in order.
-            barrier: Optional threading.Barrier.
+            barrier: Accepted for backward compatibility; ignored. Sync
+                start is now handled internally via _run_group.
         """
-        MKSMotor._sync(
+        MKSMotor._run_group(
             motors,
             lambda m: [m.move_to(*args) for args in moves],
-            barrier,
-        )
-
-    @staticmethod
-    def _jog_sync(motors, speed_rpm, cw, accel=50, barrier=None):
-        """Start or stop continuous jog on multiple motors in sync.
-
-        speed_rpm=0 issues a soft stop on every motor in the list.
-
-        Args:
-            motors: List of MKSMotor instances to jog together.
-            speed_rpm: Target speed in RPM (0 = soft stop).
-            cw: True for clockwise, False for counter-clockwise.
-            accel: Acceleration/deceleration value (0-255).
-            barrier: Optional threading.Barrier.
-        """
-        MKSMotor._sync(
-            motors,
-            lambda m: m._jog(speed_rpm, cw, accel),
-            barrier,
+            synced=True,
+            on_first_error=MKSMotor._group_fault_handler(motors, "move"),
         )
 
     @staticmethod
     def home_sync(motors, direction=0x01, barrier=None):
-        """Run homing on multiple motors in parallel.
+        """Run homing on multiple motors in parallel, with the interlock.
+
+        Homing actively sends SET_HOME / START_HOME and waits, so a CAN
+        link drop surfaces as a raised ConnectionError — most commonly a
+        START_HOME that gets no response, which would otherwise leave one
+        Z motor stationary while its partner homes and racks the gantry.
+        On any such fault, every motor in the group is emergency-stopped
+        and the group-fault hook fires (so bridge.py aborts).
 
         Args:
             motors: List of MKSMotor instances to home together.
             direction: Forwarded to home() on each motor; the group
                 shares a single homing direction.
-            barrier: Optional threading.Barrier.
+            barrier: Accepted for backward compatibility; ignored. Sync
+                start is handled internally via _run_group.
         """
-        MKSMotor._sync(motors, lambda m: m.home(direction=direction), barrier)
+        MKSMotor._run_group(
+            motors, lambda m: m.home(direction=direction), synced=True,
+            on_first_error=MKSMotor._group_fault_handler(motors, "home"))
 
     # --- High-level convenience for UI-driven control ---
 
@@ -831,31 +1006,40 @@ class MKSMotor:
             accel: Jog acceleration (0-255).
         """
         cw = positive ^ invert
-        try:
-            MKSMotor._jog_sync(motors, speed_rpm, cw, accel)
-        except Exception as e:
-            print(f"[WARN] jog_start failed: {e}")
+        # Barrier-synced start so a paired axis moves together. If ANY
+        # motor fails to receive the jog, emergency-stop the whole group
+        # rather than letting the rest run on alone.
+        MKSMotor._run_group(
+            motors, lambda m: m._jog(speed_rpm, cw, accel), synced=True,
+            on_first_error=MKSMotor._group_fault_handler(motors, "jog start"))
 
     @staticmethod
     def jog_stop(motors, accel=0):
-        """Soft-stop a group of motors.
+        """Soft-stop a group of motors, escalating to a hard stop on fault.
+
+        Each motor gets a soft F6 speed=0 (ramped) stop. If any motor
+        fails to stop — the dangerous case, since its partner has already
+        stopped and the pair would rack — every motor is escalated to an
+        F7 emergency stop with retries via stop_group_hard.
 
         Args:
             motors: List of MKSMotor instances to stop.
             accel: Deceleration value (0-255). Higher = faster stop.
         """
-        try:
-            MKSMotor._jog_sync(motors, 0, False, accel)
-        except Exception as e:
-            print(f"[WARN] jog_stop failed: {e}")
+        # No barrier: halt each motor as soon as possible.
+        MKSMotor._run_group(
+            motors, lambda m: m._jog(0, False, accel),
+            on_first_error=MKSMotor._group_fault_handler(motors, "jog stop"))
 
     @staticmethod
     def home_xz(z_motors, x_motor, home_dir_z=0x00, home_dir_x=0x01):
         """Home the paired Z axis (in parallel) and then the X axis.
 
-        Project-specific helper for the current XZ stage topology.
-        Wraps each homing call in try/except so a single-motor failure
-        is logged without aborting the rest of the sequence.
+        Project-specific helper for the current XZ stage topology. Both
+        axes go through home_sync (X as a one-motor group) so a CAN fault
+        during homing trips the interlock — emergency-stop the group and
+        fire the group-fault hook — instead of leaving one Z motor
+        stationary while its partner homes and racks the gantry.
 
         Args:
             z_motors: List of Z-axis MKSMotor instances (paired).
@@ -864,16 +1048,10 @@ class MKSMotor:
             home_dir_x: 0x90 direction byte for X homing.
         """
         print("Homing Z motors...")
-        try:
-            MKSMotor.home_sync(z_motors, direction=home_dir_z)
-        except Exception as e:
-            print(f"[WARN] Z home failed: {e}")
+        MKSMotor.home_sync(z_motors, direction=home_dir_z)
         print("Z homing complete.")
 
         print("Homing X motor...")
-        try:
-            x_motor.home(direction=home_dir_x)
-        except Exception as e:
-            print(f"[WARN] X home failed: {e}")
+        MKSMotor.home_sync([x_motor], direction=home_dir_x)
         print("X homing complete.")
 

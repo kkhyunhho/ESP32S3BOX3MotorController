@@ -9,3 +9,10 @@
 
 pyserial
 pyftdi
+
+# bridge.py exposes a small REST API alongside the TCP transport so
+# browsers / other scripts can drive the motors over HTTP. fastapi
+# pulls in pydantic + starlette; uvicorn is the ASGI server we launch
+# from a background thread.
+fastapi
+uvicorn
