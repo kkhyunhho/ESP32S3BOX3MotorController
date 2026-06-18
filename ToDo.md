@@ -385,3 +385,29 @@ Format:
 - [x] Full suite 8/8 PASS.
 - [ ] Caveat unchanged: a fully dead link can't receive F7, so that one
       motor still can't be software-stopped (hardware e-stop only).
+
+## 2026-06-18 | Control the linear rail over USB serial, reusing the UI
+
+Drive the LinearMotorController linear rail (MINAS A6) from this BOX3 via
+the host-side rail_bridge.py, **reusing the existing motor-control UI**
+(X/Z jog dial + 2D Move plot) per the admin's directive — not a
+from-scratch single-rail screen.
+
+- [x] Transport: USB-Serial-JTAG (stdout via printf+fflush) instead of
+      Wi-Fi TCP; motor_cmd.c no longer uses cmd_link_send
+- [x] main.c: drop network_init/cmd_link_start; start motor_rx after
+      ui_create; main/CMakeLists.txt drops network.c/cmd_link.c, adds
+      motor_rx.c + esp_driver_usb_serial_jtag (IDF-v6 usb_serial_jtag)
+- [x] Reuse the original dial (X jog), Home, and 2D Move plot unchanged;
+      X drives the rail, the bridge ignores Z (CMD:Z* and MOVE's Z field)
+- [x] Replace the Wi-Fi/TCP Status tab with a "Rail" tab showing the live
+      position; motor_rx.c parses POS:<mm> and updates it via
+      ui_rail_set_position()
+- [x] idf.py build clean (zero warnings); flashed + verified on hardware
+      (dial/Move/Home render, X jog + Move drive the rail, Z inert, live
+      position updates on the Rail tab)
+- [ ] Fork-PR to kkhyunhho for review
+
+> Reuses the motor-control UI as directed; the rail is the X axis, Z
+> controls are inert. Pairs with rail_bridge.py (LinearMotorController
+> PR #17). network.c/cmd_link.c remain on disk for an easy Wi-Fi revert.
