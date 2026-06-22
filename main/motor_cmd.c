@@ -31,6 +31,9 @@ void motor_cmd_jog_start(axis_t axis, dir_t dir)
     case AXIS_X:
         send_line(dir == DIR_POS ? "CMD:X+\n" : "CMD:X-\n");
         break;
+    case AXIS_Y:
+        send_line(dir == DIR_POS ? "CMD:Y+\n" : "CMD:Y-\n");
+        break;
     }
 }
 
@@ -42,6 +45,9 @@ void motor_cmd_jog_stop(axis_t axis)
         break;
     case AXIS_X:
         send_line("CMD:X0\n");
+        break;
+    case AXIS_Y:
+        send_line("CMD:Y0\n");
         break;
     }
 }

@@ -3,6 +3,7 @@
 #include "lvgl.h"
 #include "bsp/esp-bsp.h"
 
+#include <stdint.h>
 #include <stdio.h>
 
 /* ── Display dimensions ─────────────────────────────────────────────── */
@@ -45,8 +46,14 @@ static axis_t s_active_axis;
 static dir_t  s_active_dir;
 static bool   s_jogging = false;
 
-/* ── Rail tab — live position label (updated from the serial RX task) ─ */
-static lv_obj_t *s_lbl_pos;
+/* ── Y-jog (rail) state — the Y buttons drive the rail (the rail is the
+ *    Y axis); guards a stop without a matching start. ──────────────── */
+static bool   s_y_jogging = false;
+
+/* ── Rail tab — connectivity + displacement-from-origin labels,
+ *    updated from the serial RX task via ui_rail_set_status(). ─────── */
+static lv_obj_t *s_lbl_conn;
+static lv_obj_t *s_lbl_disp;
 
 /* Run a block under the display lock with a short timeout, skipping if
  * the lock cannot be taken so the RX task never stalls. */
@@ -268,11 +275,29 @@ static lv_obj_t *create_dial(lv_obj_t *parent)
     return btn;
 }
 
-/* ── Y placeholder button (no motor action) ─────────────────────────── */
+/* ── Y jog button — drives the linear rail (the rail is the Y axis) ───
+ * X/Z are reserved for the future ball-screw motors, so only Y jogs the
+ * rail. The jog direction is carried in the event user data. */
+static void y_jog_event_cb(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    dir_t dir = (dir_t)(intptr_t)lv_event_get_user_data(e);
+
+    if (code == LV_EVENT_PRESSED) {
+        s_y_jogging = true;
+        motor_cmd_jog_start(AXIS_Y, dir);
+    } else if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
+        if (s_y_jogging) {
+            motor_cmd_jog_stop(AXIS_Y);
+            s_y_jogging = false;
+        }
+    }
+}
+
 static lv_obj_t *make_y_btn(lv_obj_t *parent,
-                              lv_coord_t x, lv_coord_t y,
-                              lv_coord_t w, lv_coord_t h,
-                              const char *text)
+                            lv_coord_t x, lv_coord_t y,
+                            lv_coord_t w, lv_coord_t h,
+                            const char *text, dir_t dir)
 {
     lv_obj_t *btn = lv_button_create(parent);
     lv_obj_set_pos(btn, x, y);
@@ -290,10 +315,17 @@ static lv_obj_t *make_y_btn(lv_obj_t *parent,
     lv_obj_set_style_text_font(lbl, &lv_font_montserrat_18, 0);
     lv_obj_center(lbl);
 
+    lv_obj_add_event_cb(btn, y_jog_event_cb, LV_EVENT_PRESSED,
+                        (void *)(intptr_t)dir);
+    lv_obj_add_event_cb(btn, y_jog_event_cb, LV_EVENT_RELEASED,
+                        (void *)(intptr_t)dir);
+    lv_obj_add_event_cb(btn, y_jog_event_cb, LV_EVENT_PRESS_LOST,
+                        (void *)(intptr_t)dir);
     return btn;
 }
 
-/* ── Control tab — original dial + Y placeholder content ────────────── */
+/* ── Jog tab — X/Z dial (reserved for the future ball-screw) plus the
+ *    Y jog buttons that drive the rail. ─────────────────────────────── */
 static void build_control_tab(lv_obj_t *tab)
 {
     lv_obj_set_style_pad_all(tab, 0, 0);
@@ -310,14 +342,17 @@ static void build_control_tab(lv_obj_t *tab)
 
     create_dial(tab);
 
-    make_y_btn(tab, RIGHT_X, 2,                RIGHT_W, Y_BTN_H, "Y " LV_SYMBOL_UP);
-    make_y_btn(tab, RIGHT_X, CONTENT_H / 2 + 2, RIGHT_W, Y_BTN_H, "Y " LV_SYMBOL_DOWN);
+    make_y_btn(tab, RIGHT_X, 2, RIGHT_W, Y_BTN_H,
+               "Y " LV_SYMBOL_UP, DIR_POS);
+    make_y_btn(tab, RIGHT_X, CONTENT_H / 2 + 2, RIGHT_W, Y_BTN_H,
+               "Y " LV_SYMBOL_DOWN, DIR_NEG);
 }
 
-/* ── Rail tab — live position readout ───────────────────────────────
- * Replaces the old Wi-Fi/TCP status tab: this build talks to the host
- * over USB serial, so there is no Wi-Fi state to show. The label is
- * updated from the serial RX task via ui_rail_set_position(). */
+/* ── Rail tab — connectivity + displacement-from-origin readout ──────
+ * The rail is the Y axis. This tab shows whether the host bridge / rail
+ * link is alive and how far the rail has moved from the origin (Home /
+ * power-on = 0 mm). Both labels are updated from the serial RX task via
+ * ui_rail_set_status(). */
 static void build_rail_tab(lv_obj_t *tab)
 {
     lv_obj_set_style_pad_all(tab, 8, 0);
@@ -326,16 +361,30 @@ static void build_rail_tab(lv_obj_t *tab)
     lv_obj_clear_flag(tab, LV_OBJ_FLAG_SCROLLABLE);
 
     lv_obj_t *title = lv_label_create(tab);
-    lv_label_set_text(title, "Rail position");
+    lv_label_set_text(title, "Linear Rail (Y)");
     lv_obj_set_style_text_color(title, lv_color_hex(COL_TEXT_DIM), 0);
     lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
     lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
 
-    s_lbl_pos = lv_label_create(tab);
-    lv_label_set_text(s_lbl_pos, "— mm");
-    lv_obj_set_style_text_color(s_lbl_pos, lv_color_hex(COL_X), 0);
-    lv_obj_set_style_text_font(s_lbl_pos, &lv_font_montserrat_18, 0);
-    lv_obj_center(s_lbl_pos);
+    /* Connectivity: green "Connected" / red "Disconnected". Starts
+     * disconnected until the first STAT frame arrives. */
+    s_lbl_conn = lv_label_create(tab);
+    lv_label_set_text(s_lbl_conn, "Disconnected");
+    lv_obj_set_style_text_color(s_lbl_conn, lv_color_hex(COL_BAD), 0);
+    lv_obj_set_style_text_font(s_lbl_conn, &lv_font_montserrat_18, 0);
+    lv_obj_align(s_lbl_conn, LV_ALIGN_CENTER, 0, -18);
+
+    lv_obj_t *disp_cap = lv_label_create(tab);
+    lv_label_set_text(disp_cap, "From origin");
+    lv_obj_set_style_text_color(disp_cap, lv_color_hex(COL_TEXT_DIM), 0);
+    lv_obj_set_style_text_font(disp_cap, &lv_font_montserrat_14, 0);
+    lv_obj_align(disp_cap, LV_ALIGN_CENTER, 0, 16);
+
+    s_lbl_disp = lv_label_create(tab);
+    lv_label_set_text(s_lbl_disp, "— mm");
+    lv_obj_set_style_text_color(s_lbl_disp, lv_color_hex(COL_Y), 0);
+    lv_obj_set_style_text_font(s_lbl_disp, &lv_font_montserrat_18, 0);
+    lv_obj_align(s_lbl_disp, LV_ALIGN_CENTER, 0, 40);
 }
 
 /* ── Move tab — 2D drag-to-target picker ────────────────────────────── */
@@ -593,13 +642,20 @@ void ui_create(void)
     lv_tabview_set_active(tv, 1, LV_ANIM_OFF);
 }
 
-/* Update the live position label on the Rail tab. Called from the
- * serial RX task, so it takes the display lock internally. */
-void ui_rail_set_position(float mm)
+/* Update the Rail tab from the serial RX task (takes the display lock
+ * internally). The rail is the Y axis and the origin is Home (0 mm), so
+ * the reported position is the displacement from origin. */
+void ui_rail_set_status(bool connected, float mm)
 {
     UI_WITH_LOCK({
-        if (s_lbl_pos) {
-            lv_label_set_text_fmt(s_lbl_pos, "%.1f mm", mm);
+        if (s_lbl_conn) {
+            lv_label_set_text(s_lbl_conn,
+                              connected ? "Connected" : "Disconnected");
+            lv_obj_set_style_text_color(s_lbl_conn,
+                lv_color_hex(connected ? COL_OK : COL_BAD), 0);
+        }
+        if (s_lbl_disp) {
+            lv_label_set_text_fmt(s_lbl_disp, "%.1f mm", mm);
         }
     });
 }

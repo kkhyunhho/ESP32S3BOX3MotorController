@@ -411,3 +411,30 @@ from-scratch single-rail screen.
 > Reuses the motor-control UI as directed; the rail is the X axis, Z
 > controls are inert. Pairs with rail_bridge.py (LinearMotorController
 > PR #17). network.c/cmd_link.c remain on disk for an easy Wi-Fi revert.
+
+## 2026-06-22 | Admin revision: rail on Y axis + Rail-tab connectivity
+
+Admin feedback on the rail-control PR: move the rail jog from X to the Y
+axis (X/Z must stay empty, reserved for the future ball-screw motors),
+and add a connectivity check + displacement-from-origin readout to the
+Rail tab.
+
+- [x] motor_cmd.h: add AXIS_Y to axis_t (matches "Planned: Y-axis")
+- [x] motor_cmd.c: jog_start/stop emit CMD:Y+/Y-/Y0
+- [x] ui.c: wire the Y placeholder buttons (up=DIR_POS, down=DIR_NEG) to
+      motor_cmd_jog_start/stop(AXIS_Y, ...) via a new y_jog_event_cb; the
+      X/Z dial is left intact but inert (the bridge now ignores X/Z)
+- [x] Rail tab: connectivity label (green Connected / red Disconnected)
+      plus a "From origin" displacement (mm); ui_rail_set_position is
+      replaced by ui_rail_set_status(bool connected, float mm)
+- [x] motor_rx.c: parse STAT:<conn>:<mm> (was POS:<mm>) and add a
+      host-link staleness timer (no STAT for 3 s -> Disconnected, holding
+      the last displacement)
+- [x] idf.py build clean (zero warnings)
+- [ ] Flash + hardware verify (Y jog moves the rail, X/Z dial inert, Rail
+      tab Connected + displacement, bridge-down -> Disconnected)
+- [ ] Update review PR #1 (fork sosadTT)
+
+> Pairs with rail_bridge.py (LinearMotorController PR #17, commit
+> 31a6fd8): the bridge maps Y+/Y-/Y0 -> rail jog, ignores X/Z/MOVE, and
+> pushes STAT:<conn>:<mm>. Origin = Home (0); displacement = position.

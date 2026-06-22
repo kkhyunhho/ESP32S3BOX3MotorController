@@ -15,18 +15,36 @@
 #define RX_BUF_SIZE   256
 #define RX_LINE_MAX      32
 #define CHUNK_SIZE    64
-#define POS_PREFIX    "POS:"
+#define STAT_PREFIX   "STAT:"
 
-/* Parse one received line; act only on "POS:<mm>" frames. Anything else
- * (the device's own CMD: echoes, stray log bytes) is ignored. */
-static void parse_line(const char *line)
+/* If no STAT frame arrives within this window the bridge is down or the
+ * USB link dropped; the Rail tab then shows "Disconnected". */
+#define STALE_MS      3000
+
+/* Last position reported by a STAT frame, reused when the link goes
+ * stale so the displacement readout holds its last value. */
+static float s_last_mm = 0.0f;
+
+/* Parse one received line; act only on "STAT:<conn>:<mm>" frames, where
+ * <conn> is 1/0 (rail link health) and <mm> is the rail position =
+ * displacement from origin. Anything else (the device's own CMD: echoes,
+ * stray log bytes) is ignored. Returns true if a STAT frame was consumed
+ * so the caller can refresh the link-liveness timer. */
+static bool parse_line(const char *line)
 {
-    size_t prefix_len = strlen(POS_PREFIX);
-    if (strncmp(line, POS_PREFIX, prefix_len) != 0) {
-        return;
+    size_t prefix_len = strlen(STAT_PREFIX);
+    if (strncmp(line, STAT_PREFIX, prefix_len) != 0) {
+        return false;
     }
-    float mm = strtof(line + prefix_len, NULL);
-    ui_rail_set_position(mm);
+    const char *body = line + prefix_len;
+    const char *sep = strchr(body, ':');
+    if (sep == NULL) {
+        return false;
+    }
+    bool connected = (body[0] == '1');
+    s_last_mm = strtof(sep + 1, NULL);
+    ui_rail_set_status(connected, s_last_mm);
+    return true;
 }
 
 static void rx_task(void *arg)
@@ -35,6 +53,8 @@ static void rx_task(void *arg)
     static char line[RX_LINE_MAX];
     size_t len = 0;
     uint8_t chunk[CHUNK_SIZE];
+    TickType_t last_stat = xTaskGetTickCount();
+    bool shown_stale = false;
 
     while (1) {
         int n = usb_serial_jtag_read_bytes(chunk, sizeof(chunk),
@@ -44,7 +64,10 @@ static void rx_task(void *arg)
             if (c == '\n' || c == '\r') {
                 if (len > 0) {
                     line[len] = '\0';
-                    parse_line(line);
+                    if (parse_line(line)) {
+                        last_stat = xTaskGetTickCount();
+                        shown_stale = false;
+                    }
                     len = 0;
                 }
                 continue;
@@ -54,6 +77,14 @@ static void rx_task(void *arg)
             } else {
                 len = 0;  /* overflow before newline: drop the line */
             }
+        }
+        /* Host-link liveness: no STAT for STALE_MS means the bridge is
+         * down or the USB link dropped -> show Disconnected, holding the
+         * last known displacement. */
+        if (!shown_stale &&
+            (xTaskGetTickCount() - last_stat) > pdMS_TO_TICKS(STALE_MS)) {
+            ui_rail_set_status(false, s_last_mm);
+            shown_stale = true;
         }
     }
 }
