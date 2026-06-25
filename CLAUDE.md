@@ -11,13 +11,15 @@ shared conda env, testing strategy, and task/commit rules — see
 This file holds only what is specific to this project. Where it is silent,
 CommonClaude governs.
 
-This project is the **device driver** for codename **`mks_motor`** (PC-side
+This project is the **L0 driver** for codename **`mks_motor`** (PC-side
 Python: package [src/mks_motor/](src/mks_motor/), class `MKSMotor`,
 `pip install -e`'d into the `elec` env) **plus** an ESP-IDF firmware for the
-ESP32-S3-BOX-3. The firmware is an exceptional, partially-built piece of the
-**L3 lab-control layer** (a touch UI / network bridge), not a device driver —
-see [ARCHITECTURE.md in CommonClaude]. C firmware lives in `main/`; the
-Python driver in `src/`.
+ESP32-S3-BOX-3 that is a partially-built **L2** (ESP touchscreen / physical
+UI) for the motors — see Levels in CommonClaude's `ARCHITECTURE.md`. C
+firmware lives in `main/`; the Python driver in `src/`.
+
+(Terminology: **Level/L** = control-code depth — L0 driver, L1 server, L2
+ESP UI. **Phase** = SDL hardware stage. See CommonClaude.)
 
 ## Project
 
