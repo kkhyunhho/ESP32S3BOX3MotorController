@@ -2,6 +2,23 @@
 
 This file provides guidance to Claude Code when working with code in this repository.
 
+## Conventions
+
+For the big picture and all shared conventions — the "one cell, many
+devices" architecture, code style, repo skeleton, codename naming, the
+shared conda env, testing strategy, and task/commit rules — see
+**CommonClaude** (`kkhyunhho/CommonClaude`), the single source of truth.
+This file holds only what is specific to this project. Where it is silent,
+CommonClaude governs.
+
+This project is the **device driver** for codename **`mks_motor`** (PC-side
+Python: package [src/mks_motor/](src/mks_motor/), class `MKSMotor`,
+`pip install -e`'d into the `elec` env) **plus** an ESP-IDF firmware for the
+ESP32-S3-BOX-3. The firmware is an exceptional, partially-built piece of the
+**L3 lab-control layer** (a touch UI / network bridge), not a device driver —
+see [ARCHITECTURE.md in CommonClaude]. C firmware lives in `main/`; the
+Python driver in `src/`.
+
 ## Project
 
 ESP-IDF firmware for the **ESP32-S3-BOX-3** dev board, paired with a PC-side
@@ -69,17 +86,26 @@ python bridge.py                    # start PC-side CAN bridge
 source /root/.espressif/v6.0.1/esp-idf/export.sh   # per terminal
 idf.py set-target esp32s3
 idf.py build
-idf.py -p /dev/ttyACM0 flash monitor
+./flash.sh monitor                  # flash + monitor — see WARNING below
 python3 bridge.py                   # rebuilds USB nodes + runs bridge
 python3 CVMeasure.py                # CV diagonal-stair measurement run
 python3 CAN2USBAdapterDeviceRecognition.py   # list FTDI adapter serials
 ```
 
-Per-env one-time Python dep install (after activating a conda env or
-venv):
+> **Do NOT `idf.py -p /dev/ttyACM0 flash`.** On this rig `/dev/ttyACM0`
+> is the **Sartorius Picus pipette**, not the ESP32 — flashing it targets
+> the wrong device. Use [flash.sh](flash.sh), which resolves the board by
+> its USB identity (Espressif VID `303a`) from sysfs and rebuilds the
+> `/dev` node (container `/dev` is a private tmpfs). The ESP32 must be on
+> its USB-C **data** port; until then `303a` won't appear and the script
+> exits with a clear message.
+
+Python side uses the shared conda env **`elec`** (new terminals activate
+it). Install this driver editable once:
 
 ```bash
-pip install -r requirements.txt     # pyserial + pyftdi
+conda activate elec
+pip install -e ".[dev,bridge]"      # pyftdi + pyserial (+ fastapi/uvicorn)
 ```
 
 `bridge.py` and `CVMeasure.py` call `prepare_usb_nodes()` /
@@ -105,18 +131,19 @@ main/                       ESP32 firmware
 ├── ui.c / ui.h             LVGL touch UI (Z/X quadrant dial + Y placeholder)
 ├── motor_cmd.c / .h        Button event → ASCII command on stdout (USB serial)
 └── idf_component.yml       esp32_s3_box_3 BSP dependency
+src/mks_motor/              MKS SERVO57D CAN driver package (pyftdi-based);
+  mks_motor.py              class MKSMotor + module helpers
+                            prepare_usb_nodes / release_ftdi_sio /
+                            set_group_fault_hook (re-exported by __init__)
 bridge.py                   PC-side serial→CAN bridge (jog / home routing)
-mks_motor.py                MKS SERVO57D CAN library (pyftdi-based) +
-                            module helpers prepare_usb_nodes /
-                            release_ftdi_sio / open_xz
 CVMeasure.py                Stand-alone CV measurement run: 5-step
                             diagonal stair via absolute moves
 CAN2USBAdapterDeviceRecognition.py
                             Print connected FTDI adapter serials —
                             run this to populate SERIAL_X
 launch_bridge.bat           Windows double-click launcher for bridge.py
-requirements.txt            Python deps for the bridge (pyserial + pyftdi);
-                            install once per env with `pip install -r ...`
+pyproject.toml              Python packaging + ruff/mypy config; deps
+                            pyftdi + pyserial (bridge extra: fastapi/uvicorn)
 setup_docker.sh             First-time ESP-IDF install inside a build
                             container (no USB / udev steps)
 SETUP_UBUNTU.md             Host-side notes (udev rule, dialout, USB hub
@@ -273,10 +300,11 @@ Declared in `main/idf_component.yml`:
 - `espressif/esp32_s3_box_3` — BSP (display, touch, I2C, LVGL task, backlight).
   Owns the LVGL rendering task on core 0.
 
-Python side ([bridge.py](bridge.py) / [CVMeasure.py](CVMeasure.py))
-requires `pyserial` (ESP32 CDC link) and `pyftdi` (USB2CAN adapter
-access over libusb). Listed in [requirements.txt](requirements.txt);
-install once per env with `pip install -r requirements.txt`.
+Python side (`src/mks_motor/`, [bridge.py](bridge.py) /
+[CVMeasure.py](CVMeasure.py)) requires `pyserial` (ESP32 CDC link) and
+`pyftdi` (USB2CAN adapter access over libusb), with `fastapi`/`uvicorn`
+for the bridge's REST API. Declared in [pyproject.toml](pyproject.toml);
+`pip install -e ".[dev,bridge]"` into the `elec` env.
 
 Do **not** edit anything under `managed_components/` — regenerated from
 `dependencies.lock`.
@@ -296,161 +324,9 @@ When the Y-axis motor is added, the following touchpoints must change in lock-st
   and wire `Y+` / `Y-` / `Y0` handlers; update `home_all` to include Y.
 - README and this file's motor table.
 
----
+## Known traps (project-specific)
 
-# Common Claude Conventions
-
-The rules below govern how Claude Code works in this repository.
-When project-specific sections above conflict with these, the project section wins.
-
-## 1. Rule Priority
-
-Project-level `CLAUDE.md` supersedes global rulesets. More-specific context
-always wins.
-
----
-
-## 2. C Code Convention (Google style guide, C-adapted)
-
-All new C code follows the C-applicable subset of the
-[Google C++ Style Guide](https://google.github.io/styleguide/cppguide.html).
-Third-party code under `managed_components/` is exempt.
-
-### Naming
-
-| Element | Style | Example |
-|---------|-------|---------|
-| Variable / parameter / local | `snake_case` | `can_id`, `jog_speed` |
-| Function | `snake_case` (`module_action`) | `motor_cmd_jog_start`, `ui_create` |
-| Struct / typedef | `snake_case_t` | `btn_ctx_t` |
-| Enum constant | `SCREAMING_SNAKE_CASE` | `DIR_POS`, `AXIS_Z` |
-| Macro / `#define` | `SCREAMING_SNAKE_CASE` | `MKS_STATUS_OK`, `BTN_SZ` |
-| File | `snake_case.c` / `.h` | `motor_cmd.c`, `motor_cmd.h` |
-| Module-internal globals | `static`, prefix `s_` | `static bool s_jogging` |
-
-Additional rules:
-- Names must be pronounceable; abbreviate only for industry-standard terms
-  (`can`, `twai`, `gpio`, `dma`).
-- Name length scales with scope — short for loop counters, descriptive for
-  public API parameters.
-- Variables / structs are nouns; functions are verbs (`read_*`, `init_*`, `jog_*`).
-
-### Structure
-
-- **80-column line limit** for new code.
-- One statement per line.
-- Indent with **4 spaces** (never tabs).
-- Declare variables in the narrowest possible scope, close to first use.
-- File-scope `static` for module-internal globals and helpers.
-
-### Header files
-
-- `#pragma once` header guard.
-- Include order (blank-line separated):
-  1. Matching `.h` for the `.c` file
-  2. C system headers (`<stdint.h>`, `<string.h>`, …)
-  3. ESP-IDF / FreeRTOS headers
-  4. Third-party / managed component headers (`"lvgl.h"`, `"bsp/esp-bsp.h"`)
-  5. Project-internal headers
-
-### Spacing & braces
-
-- One space after commas; one space around binary operators.
-- K&R brace style: opening brace on the same line for `if`/`for`/`while`;
-  separate line for function definitions.
-- Always brace single-statement bodies.
-
-### Comments
-
-- Comment the *why*, never restate the *what*.
-- Public functions get a short Doxygen-style block (purpose, params, return).
-- Delete outdated comments rather than preserving them.
-- English only in all code comments and commit messages.
-
----
-
-## 3. Python Code Convention (PC bridge)
-
-`bridge.py`, `mks_motor.py`, and `CVMeasure.py` follow the global Python
-style:
-- **Python 3.10+** is the supported floor (no walrus-only-3.8 / `match`
-  is fine, but nothing fancier is required). Tested on Python 3.11
-  (conda env `lh`) and 3.14. The ESP-IDF bundled venv is also 3.11.
-- 4-space indent, 80-column limit, ruff formatted.
-- `snake_case` for functions/variables, `CamelCase` for classes.
-- Google-style docstrings on public functions/classes (`Args:`,
-  `Returns:`, `Raises:`).
-- No magic numbers — use module-level constants (see `JOG_SPEED_RPM`,
-  `JOG_ACCEL`, `SERIAL_X`, `HOME_DIR_Z`, etc. at the top of `bridge.py`
-  / `CVMeasure.py`).
-
----
-
-## 4. Debug File Management
-
-Debug / exploratory files go in `claude_test/`, never in `main/` or the
-project root.
-
-| Location | Contents |
-|----------|----------|
-| `main/` | Production firmware code |
-| Project root | Production PC-side scripts (`bridge.py`, `mks_motor.py`) |
-| `claude_test/` | One-off probes, Python diagnostics, scratch examples |
-
-When adding a debug file, append a row to `claude_test/README.md` with purpose
-and lessons. Promote useful logic into `main/` or the bridge scripts and delete
-the debug file.
-
----
-
-## 5. Task Management
-
-For every non-trivial task:
-
-1. Validate the command — confirm target, method, and purpose if ambiguous.
-2. Append a dated section to `ToDo.md` (append-only; never delete past entries):
-   ```markdown
-   ## YYYY-MM-DD | Task title
-   - [ ] subtask 1
-   - [ ] subtask 2
-   ```
-3. Check items off (`- [x]`) as work completes; append a one-line summary.
-4. Commit after each completed command when working in a git repo.
-5. **Auto-push**: a Stop hook in [.claude/settings.json](.claude/settings.json)
-   runs [.claude/auto-push.sh](.claude/auto-push.sh) at the end of every
-   Claude turn. When the current branch is 5+ commits ahead of its
-   upstream, the script issues `git push` and prints a one-line
-   `[auto-push]` notice (success or failure). Threshold can be tuned
-   by editing `THRESHOLD` in the script. To disable entirely, remove
-   the hook from `settings.json`.
-
----
-
-## 6. Testing Rules
-
-1. **No magic numbers** — use named constants with meaningful names.
-2. **No hardcoding to match test inputs** — fix the logic, not the branch.
-3. **Code quality first** — readability and correctness beat green CI.
-
----
-
-## 7. Build & Static Checks
-
-1. **Zero warnings** — `idf.py build` must finish with no warnings on touched files.
-2. **Verify on real hardware after non-trivial changes** — a clean build is
-   necessary but not sufficient; flash and confirm boot logs + bridge response.
-3. **Never silence warnings** with casts or `#pragma` without a documented reason.
-
----
-
-## 8. Research Before Coding
-
-1. Check `managed_components/<name>/README.md` for the actual API before calling it.
-2. Read the header — confirm real function signatures before writing call sites.
-3. Search the codebase for prior usage of the same symbol.
-4. Trust documentation over intuition.
-
-Known traps in this project:
+Read these before touching motion code — several are safety-critical:
 - `bsp_display_lock(0)` — `0` means "wait indefinitely", not "non-blocking".
 - ESP32 firmware does **not** speak CAN in bridge mode. If a future change
   reintroduces direct-CAN on the ESP32, update the architecture diagram and
@@ -505,10 +381,3 @@ Known traps in this project:
   `bridge.py` / `CVMeasure.py`) handles this. A host-side udev rule
   is the permanent fix — see [SETUP_UBUNTU.md](SETUP_UBUNTU.md).
 
----
-
-## 9. Learned Patterns Reference
-
-When `LearnedPatterns.md` exists at the project root, read relevant sections
-before drafting `ToDo.md`, and append new gotchas after task completion using
-the **Problem / Cause / Fix / Rule** format.
