@@ -46,11 +46,15 @@ void cmd_link_send(const char *line);
  *                        to send() (trailing '\n' stripped), or "" if
  *                        nothing has been sent since boot.
  * cmd_link_last_send_us: `esp_timer_get_time()` timestamp of the last
- *                        successful send; 0 when never. */
+ *                        successful send; 0 when never.
+ * cmd_link_get_position: copies the latest "X <mm> Z <mm>" position the
+ *                        PC pushed via "POS:...", or "" if none / the
+ *                        link is down. `cap` includes the NUL. */
 bool    cmd_link_has_client(void);
 void    cmd_link_get_peer(char *out, size_t cap);
 void    cmd_link_get_last_cmd(char *out, size_t cap);
 int64_t cmd_link_last_send_us(void);
+void    cmd_link_get_position(char *out, size_t cap);
 
 #ifdef __cplusplus
 }

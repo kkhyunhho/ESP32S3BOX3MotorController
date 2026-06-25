@@ -35,6 +35,7 @@ static uint16_t s_port;
 static char s_peer[24];           /* "xxx.xxx.xxx.xxx:ppppp" + NUL */
 static char s_last_cmd[24];       /* longest is "CMD:HOME" — keep slack */
 static int64_t s_last_send_us;    /* 0 means "no send yet since boot" */
+static char s_pos[32];            /* latest "X .. Z .." from PC; "" = none */
 
 void cmd_link_send(const char *line)
 {
@@ -72,6 +73,21 @@ void cmd_link_send(const char *line)
     memcpy(s_last_cmd, line, copy_len);
     s_last_cmd[copy_len] = '\0';
     s_last_send_us = esp_timer_get_time();
+    xSemaphoreGive(s_mutex);
+}
+
+/* Handle one newline-delimited line received from the PC. The only line
+ * we consume is the position feedback "POS:X <mm> Z <mm>"; the rest is
+ * ignored. Stores just the "X .. Z .." payload for the UI to display. */
+static void handle_rx_line(const char *line)
+{
+    if (strncmp(line, "POS:", 4) != 0) {
+        return;
+    }
+    const char *payload = line + 4;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    strncpy(s_pos, payload, sizeof(s_pos) - 1);
+    s_pos[sizeof(s_pos) - 1] = '\0';
     xSemaphoreGive(s_mutex);
 }
 
@@ -145,11 +161,28 @@ static void server_task(void *arg)
         xSemaphoreGive(s_mutex);
 
         /* Block until the client closes or cmd_link_send shuts the fd
-         * down after a write error. We never consume what the client
-         * sends — the link is one-way (ESP32 → PC). */
-        char buf[16];
-        while (recv(client, buf, sizeof(buf), 0) > 0) {
-            /* discard */
+         * down after a write error. The PC pushes "POS:..." position
+         * updates back to us, so accumulate bytes into newline-delimited
+         * lines and hand each one to handle_rx_line. */
+        char rx[64];
+        char line[64];
+        size_t line_len = 0;
+        int n;
+        while ((n = recv(client, rx, sizeof(rx), 0)) > 0) {
+            for (int i = 0; i < n; i++) {
+                char c = rx[i];
+                if (c == '\n' || c == '\r') {
+                    if (line_len > 0) {
+                        line[line_len] = '\0';
+                        handle_rx_line(line);
+                        line_len = 0;
+                    }
+                } else if (line_len < sizeof(line) - 1) {
+                    line[line_len++] = c;
+                } else {
+                    line_len = 0;  /* oversized line — drop it */
+                }
+            }
         }
 
         ESP_LOGI(TAG, "client disconnected");
@@ -157,6 +190,7 @@ static void server_task(void *arg)
         if (s_client_fd == client) {
             s_client_fd = -1;
             s_peer[0] = '\0';
+            s_pos[0] = '\0';  /* position is stale once the PC is gone */
         }
         xSemaphoreGive(s_mutex);
         close(client);
@@ -200,6 +234,21 @@ void cmd_link_get_last_cmd(char *out, size_t cap)
     }
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     strncpy(out, s_last_cmd, cap - 1);
+    out[cap - 1] = '\0';
+    xSemaphoreGive(s_mutex);
+}
+
+void cmd_link_get_position(char *out, size_t cap)
+{
+    if (out == NULL || cap == 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (s_mutex == NULL) {
+        return;
+    }
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    strncpy(out, s_pos, cap - 1);
     out[cap - 1] = '\0';
     xSemaphoreGive(s_mutex);
 }

@@ -164,6 +164,7 @@ class MKSMotor:
     # dropped slot. No physical dummy motion required.
 
     # MKS command opcodes used by this file.
+    CMD_READ_ENCODER    = 0x31   # read cumulative multi-turn encoder (abs pos)
     CMD_READ_IO         = 0x34   # read IN_1/IN_2/OUT_1/OUT_2 state
     CMD_SET_MODE        = 0x82   # 0x05 selects SR_vFOC
     CMD_SLAVE_RESP      = 0x8C   # enable active response from the motor
@@ -407,30 +408,33 @@ class MKSMotor:
 
     # --- Low-level: CAN packet over USB2CAN ---
 
-    def _send(self, cmd, *data, silent=False):
-        """Send a CAN command and return the response.
+    def _transceive(self, cmd, *data, silent=False):
+        """Send a CAN command and return the raw 18-byte USB2CAN response.
 
-        Builds [cmd][data...][checksum] padded to 8 bytes,
-        then wraps it in an 18-byte USB2CAN binary packet.
+        Shared TX + retry-read core. _send() uses this and returns just
+        the status byte; multi-byte readers (read_position_mm) use it to
+        parse the full payload.
+
+        Builds [cmd][data...][checksum] padded to 8 bytes, wraps it in an
+        18-byte USB2CAN binary packet, and reads the reply.
 
         Args:
             cmd: MKS command code (e.g. 0xF5).
             *data: Variable-length data bytes.
-            silent: Suppress TX/RX logging if True.
+            silent: Suppress TX logging if True.
 
         Returns:
-            Status byte from the motor response,
-            or None if broadcast or no response.
+            The 18-byte response (bytes), or None for a broadcast ID
+            (no response expected).
 
         Raises:
-            ConnectionError: If no valid response
-                after retries.
+            ValueError: If the payload exceeds the 8-byte CAN frame.
+            ConnectionError: If no valid response after retries.
         """
         data_bytes = list(data)
         dlc = 1 + len(data_bytes) + 1
         if dlc > 8:
-            print(f"[ERROR] Too much data ({dlc} bytes, max 8)")
-            return None
+            raise ValueError(f"Too much data ({dlc} bytes, max 8)")
 
         checksum = (self.can_id + cmd + sum(data_bytes)) & 0xFF
         motor_bytes = [cmd] + data_bytes + [checksum]
@@ -473,7 +477,28 @@ class MKSMotor:
             raise ConnectionError(
                 f"No response for 0x{cmd:02X} -- check CAN wiring, power, and bitrate"
             )
+        return resp
 
+    def _send(self, cmd, *data, silent=False):
+        """Send a CAN command and return the status byte.
+
+        Thin wrapper over _transceive that extracts the single status
+        byte (resp[9]) and pretty-prints it.
+
+        Args:
+            cmd: MKS command code (e.g. 0xF5).
+            *data: Variable-length data bytes.
+            silent: Suppress TX/RX logging if True.
+
+        Returns:
+            Status byte from the motor response, or None if broadcast.
+
+        Raises:
+            ConnectionError: If no valid response after retries.
+        """
+        resp = self._transceive(cmd, *data, silent=silent)
+        if resp is None:
+            return None
         status = resp[9]
         if not silent:
             if cmd in self._motion_cmds:
@@ -483,6 +508,32 @@ class MKSMotor:
             status_label = table.get(status, f"Unknown 0x{status:02X}")
             print(f"[RX] {status_label}")
         return status
+
+    def read_position_mm(self):
+        """Read the motor's absolute position in mm (CAN 0x31).
+
+        Reads the cumulative multi-turn encoder value — a signed 48-bit
+        count where one full turn = ``_encoder_per_turn`` — and converts
+        it to mm via the ball-screw pitch. Honors ``coord_invert`` so the
+        sign matches the convention move_to() takes.
+
+        Returns:
+            Position in mm (float), or None if the reply was a stray
+            frame (wrong command echo).
+
+        Raises:
+            ConnectionError: If the motor does not respond after retries.
+        """
+        resp = self._transceive(self.CMD_READ_ENCODER, silent=True)
+        if resp is None:
+            return None
+        # Motor payload occupies resp[8:16]: [0x31][value 6B][checksum].
+        # Reject a stray frame whose command echo isn't our read.
+        if resp[8] != self.CMD_READ_ENCODER:
+            return None
+        value = int.from_bytes(resp[9:15], "big", signed=True)  # int48
+        mm = value / self._encoder_per_turn * self._mm_per_turn
+        return -mm if self.coord_invert else mm
 
     def _wait(self):
         """Wait for async motor response.
