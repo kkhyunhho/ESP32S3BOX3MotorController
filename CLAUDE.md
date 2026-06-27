@@ -7,19 +7,19 @@ This file provides guidance to Claude Code when working with code in this reposi
 For the big picture and all shared conventions — the "one cell, many
 devices" architecture, code style, repo skeleton, codename naming, the
 shared conda env, testing strategy, and task/commit rules — see
-**CommonClaude** (`kkhyunhho/CommonClaude`), the single source of truth.
+**SDLClaude** (`kkhyunhho/SDLClaude`), the single source of truth.
 This file holds only what is specific to this project. Where it is silent,
-CommonClaude governs.
+SDLClaude governs.
 
 This project is the **L0 driver** for codename **`mks_motor`** (PC-side
 Python: package [src/mks_motor/](src/mks_motor/), class `MKSMotor`,
 `pip install -e`'d into the `elec` env) **plus** an ESP-IDF firmware for the
 ESP32-S3-BOX-3 that is a partially-built **L2** (ESP touchscreen / physical
-UI) for the motors — see Levels in CommonClaude's `ARCHITECTURE.md`. C
+UI) for the motors — see Levels in SDLClaude's `ARCHITECTURE.md`. C
 firmware lives in `main/`; the Python driver in `src/`.
 
 (Terminology: **Level/L** = control-code depth — L0 driver, L1 server, L2
-ESP UI. **Phase** = SDL hardware stage. See CommonClaude.)
+ESP UI. **Phase** = SDL hardware stage. See SDLClaude.)
 
 ## Project
 
