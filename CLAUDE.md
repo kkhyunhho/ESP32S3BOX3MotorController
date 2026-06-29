@@ -13,7 +13,7 @@ SDLClaude governs.
 
 This project is the **L0 driver** for codename **`mks_motor`** (PC-side
 Python: package [src/mks_motor/](src/mks_motor/), class `MKSMotor`,
-`pip install -e`'d into the `elec` env) **plus** an ESP-IDF firmware for the
+`pip install -e`'d into the `sdl` env) **plus** an ESP-IDF firmware for the
 ESP32-S3-BOX-3 that is a partially-built **L2** (ESP touchscreen / physical
 UI) for the motors — see Levels in SDLClaude's `ARCHITECTURE.md`. C
 firmware lives in `main/`; the Python driver in `src/`.
@@ -102,11 +102,11 @@ python3 CAN2USBAdapterDeviceRecognition.py   # list FTDI adapter serials
 > its USB-C **data** port; until then `303a` won't appear and the script
 > exits with a clear message.
 
-Python side uses the shared conda env **`elec`** (new terminals activate
+Python side uses the shared conda env **`sdl`** (new terminals activate
 it). Install this driver editable once:
 
 ```bash
-conda activate elec
+conda activate sdl
 pip install -e ".[dev,bridge]"      # pyftdi + pyserial (+ fastapi/uvicorn)
 ```
 
@@ -306,7 +306,7 @@ Python side (`src/mks_motor/`, [bridge.py](bridge.py) /
 [CVMeasure.py](CVMeasure.py)) requires `pyserial` (ESP32 CDC link) and
 `pyftdi` (USB2CAN adapter access over libusb), with `fastapi`/`uvicorn`
 for the bridge's REST API. Declared in [pyproject.toml](pyproject.toml);
-`pip install -e ".[dev,bridge]"` into the `elec` env.
+`pip install -e ".[dev,bridge]"` into the `sdl` env.
 
 Do **not** edit anything under `managed_components/` — regenerated from
 `dependencies.lock`.
