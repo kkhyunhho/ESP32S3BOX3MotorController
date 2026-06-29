@@ -385,3 +385,56 @@ Format:
 - [x] Full suite 8/8 PASS.
 - [ ] Caveat unchanged: a fully dead link can't receive F7, so that one
       motor still can't be software-stopped (hardware e-stop only).
+
+## 2026-06-18 | Control the linear rail over USB serial, reusing the UI
+
+Drive the LinearMotorController linear rail (MINAS A6) from this BOX3 via
+the host-side rail_bridge.py, **reusing the existing motor-control UI**
+(X/Z jog dial + 2D Move plot) per the admin's directive — not a
+from-scratch single-rail screen.
+
+- [x] Transport: USB-Serial-JTAG (stdout via printf+fflush) instead of
+      Wi-Fi TCP; motor_cmd.c no longer uses cmd_link_send
+- [x] main.c: drop network_init/cmd_link_start; start motor_rx after
+      ui_create; main/CMakeLists.txt drops network.c/cmd_link.c, adds
+      motor_rx.c + esp_driver_usb_serial_jtag (IDF-v6 usb_serial_jtag)
+- [x] Reuse the original dial (X jog), Home, and 2D Move plot unchanged;
+      X drives the rail, the bridge ignores Z (CMD:Z* and MOVE's Z field)
+- [x] Replace the Wi-Fi/TCP Status tab with a "Rail" tab showing the live
+      position; motor_rx.c parses POS:<mm> and updates it via
+      ui_rail_set_position()
+- [x] idf.py build clean (zero warnings); flashed + verified on hardware
+      (dial/Move/Home render, X jog + Move drive the rail, Z inert, live
+      position updates on the Rail tab)
+- [ ] Fork-PR to kkhyunhho for review
+
+> Reuses the motor-control UI as directed; the rail is the X axis, Z
+> controls are inert. Pairs with rail_bridge.py (LinearMotorController
+> PR #17). network.c/cmd_link.c remain on disk for an easy Wi-Fi revert.
+
+## 2026-06-22 | Admin revision: rail on Y axis + Rail-tab connectivity
+
+Admin feedback on the rail-control PR: move the rail jog from X to the Y
+axis (X/Z must stay empty, reserved for the future ball-screw motors),
+and add a connectivity check + displacement-from-origin readout to the
+Rail tab.
+
+- [x] motor_cmd.h: add AXIS_Y to axis_t (matches "Planned: Y-axis")
+- [x] motor_cmd.c: jog_start/stop emit CMD:Y+/Y-/Y0
+- [x] ui.c: wire the Y placeholder buttons (up=DIR_POS, down=DIR_NEG) to
+      motor_cmd_jog_start/stop(AXIS_Y, ...) via a new y_jog_event_cb; the
+      X/Z dial is left intact but inert (the bridge now ignores X/Z)
+- [x] Rail tab: connectivity label (green Connected / red Disconnected)
+      plus a "From origin" displacement (mm); ui_rail_set_position is
+      replaced by ui_rail_set_status(bool connected, float mm)
+- [x] motor_rx.c: parse STAT:<conn>:<mm> (was POS:<mm>) and add a
+      host-link staleness timer (no STAT for 3 s -> Disconnected, holding
+      the last displacement)
+- [x] idf.py build clean (zero warnings)
+- [ ] Flash + hardware verify (Y jog moves the rail, X/Z dial inert, Rail
+      tab Connected + displacement, bridge-down -> Disconnected)
+- [ ] Update review PR #1 (fork sosadTT)
+
+> Pairs with rail_bridge.py (LinearMotorController PR #17, commit
+> 31a6fd8): the bridge maps Y+/Y-/Y0 -> rail jog, ignores X/Z/MOVE, and
+> pushes STAT:<conn>:<mm>. Origin = Home (0); displacement = position.

@@ -1,10 +1,9 @@
 #include "ui.h"
 #include "motor_cmd.h"
-#include "cmd_link.h"
-#include "network.h"
 #include "lvgl.h"
-#include "esp_timer.h"
+#include "bsp/esp-bsp.h"
 
+#include <stdint.h>
 #include <stdio.h>
 
 /* ── Display dimensions ─────────────────────────────────────────────── */
@@ -47,16 +46,24 @@ static axis_t s_active_axis;
 static dir_t  s_active_dir;
 static bool   s_jogging = false;
 
-/* ── Status-tab widgets, updated by the 1 Hz refresh timer ──────────── */
-static lv_obj_t *s_lbl_wifi_state;
-static lv_obj_t *s_lbl_ssid;
-static lv_obj_t *s_lbl_ip;
-static lv_obj_t *s_lbl_rssi;
-static lv_obj_t *s_lbl_mac;
-static lv_obj_t *s_lbl_tcp_state;
-static lv_obj_t *s_lbl_peer;
-static lv_obj_t *s_lbl_last_cmd;
-static lv_obj_t *s_rssi_bars[4];
+/* ── Y-jog (rail) state — the Y buttons drive the rail (the rail is the
+ *    Y axis); guards a stop without a matching start. ──────────────── */
+static bool   s_y_jogging = false;
+
+/* ── Rail tab — connectivity + displacement-from-origin labels,
+ *    updated from the serial RX task via ui_rail_set_status(). ─────── */
+static lv_obj_t *s_lbl_conn;
+static lv_obj_t *s_lbl_disp;
+
+/* Run a block under the display lock with a short timeout, skipping if
+ * the lock cannot be taken so the RX task never stalls. */
+#define UI_WITH_LOCK(BLOCK)         \
+    do {                            \
+        if (bsp_display_lock(50)) { \
+            BLOCK;                  \
+            bsp_display_unlock();   \
+        }                           \
+    } while (0)
 
 /* ── Move-tab geometry ──────────────────────────────────────────────── */
 /* The plot lives in the LEFT pane of the tab (mirrors Jog Control's
@@ -275,11 +282,29 @@ static lv_obj_t *create_dial(lv_obj_t *parent)
     return btn;
 }
 
-/* ── Y placeholder button (no motor action) ─────────────────────────── */
+/* ── Y jog button — drives the linear rail (the rail is the Y axis) ───
+ * X/Z are reserved for the future ball-screw motors, so only Y jogs the
+ * rail. The jog direction is carried in the event user data. */
+static void y_jog_event_cb(lv_event_t *e)
+{
+    lv_event_code_t code = lv_event_get_code(e);
+    dir_t dir = (dir_t)(intptr_t)lv_event_get_user_data(e);
+
+    if (code == LV_EVENT_PRESSED) {
+        s_y_jogging = true;
+        motor_cmd_jog_start(AXIS_Y, dir);
+    } else if (code == LV_EVENT_RELEASED || code == LV_EVENT_PRESS_LOST) {
+        if (s_y_jogging) {
+            motor_cmd_jog_stop(AXIS_Y);
+            s_y_jogging = false;
+        }
+    }
+}
+
 static lv_obj_t *make_y_btn(lv_obj_t *parent,
-                              lv_coord_t x, lv_coord_t y,
-                              lv_coord_t w, lv_coord_t h,
-                              const char *text)
+                            lv_coord_t x, lv_coord_t y,
+                            lv_coord_t w, lv_coord_t h,
+                            const char *text, dir_t dir)
 {
     lv_obj_t *btn = lv_button_create(parent);
     lv_obj_set_pos(btn, x, y);
@@ -297,10 +322,17 @@ static lv_obj_t *make_y_btn(lv_obj_t *parent,
     lv_obj_set_style_text_font(lbl, &lv_font_montserrat_18, 0);
     lv_obj_center(lbl);
 
+    lv_obj_add_event_cb(btn, y_jog_event_cb, LV_EVENT_PRESSED,
+                        (void *)(intptr_t)dir);
+    lv_obj_add_event_cb(btn, y_jog_event_cb, LV_EVENT_RELEASED,
+                        (void *)(intptr_t)dir);
+    lv_obj_add_event_cb(btn, y_jog_event_cb, LV_EVENT_PRESS_LOST,
+                        (void *)(intptr_t)dir);
     return btn;
 }
 
-/* ── Control tab — original dial + Y placeholder content ────────────── */
+/* ── Jog tab — X/Z dial (reserved for the future ball-screw) plus the
+ *    Y jog buttons that drive the rail. ─────────────────────────────── */
 /* One-line current-position readout pinned to the bottom-left of a
  * control tab. Auto-sized (no fixed width) so it always stays one line;
  * the values come from pos_refresh_cb. */
@@ -330,183 +362,51 @@ static void build_control_tab(lv_obj_t *tab)
 
     create_dial(tab);
 
-    make_y_btn(tab, RIGHT_X, 2,                RIGHT_W, Y_BTN_H, "Y " LV_SYMBOL_UP);
-    make_y_btn(tab, RIGHT_X, CONTENT_H / 2 + 2, RIGHT_W, Y_BTN_H, "Y " LV_SYMBOL_DOWN);
+    make_y_btn(tab, RIGHT_X, 2, RIGHT_W, Y_BTN_H,
+               "Y " LV_SYMBOL_UP, DIR_POS);
+    make_y_btn(tab, RIGHT_X, CONTENT_H / 2 + 2, RIGHT_W, Y_BTN_H,
+               "Y " LV_SYMBOL_DOWN, DIR_NEG);
 
     s_lbl_pos_jog = make_pos_label(tab);
 }
 
-/* ── Status-tab helpers ─────────────────────────────────────────────── */
-
-/* RSSI dBm to a 0..4 bar count, mirroring how phones quantize signal. */
-static int rssi_to_bars(int rssi)
-{
-    if (rssi == 0)           return 0;   /* "not connected" sentinel */
-    if (rssi >= -50)         return 4;
-    if (rssi >= -65)         return 3;
-    if (rssi >= -75)         return 2;
-    if (rssi >= -85)         return 1;
-    return 0;
-}
-
-static const char *rssi_quality_label(int rssi)
-{
-    int b = rssi_to_bars(rssi);
-    switch (b) {
-        case 4:  return "excellent";
-        case 3:  return "good";
-        case 2:  return "fair";
-        case 1:  return "weak";
-        default: return rssi == 0 ? "—" : "lost";
-    }
-}
-
-/* Build the 4 phone-style RSSI bars next to the RSSI text. Bars grow
- * in height from left to right; the lit ones take a colour that
- * reflects overall signal quality. */
-static void build_rssi_bars(lv_obj_t *parent, int x, int baseline_y)
-{
-    const int bar_w   = 5;
-    const int bar_gap = 3;
-    const int heights[4] = { 5, 9, 13, 17 };
-    for (int i = 0; i < 4; i++) {
-        lv_obj_t *bar = lv_obj_create(parent);
-        lv_obj_remove_style_all(bar);
-        lv_obj_set_size(bar, bar_w, heights[i]);
-        lv_obj_set_pos(bar,
-                       x + i * (bar_w + bar_gap),
-                       baseline_y - heights[i]);
-        lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
-        lv_obj_set_style_radius(bar, 1, 0);
-        lv_obj_set_style_bg_color(bar, lv_color_hex(COL_OFF), 0);
-        s_rssi_bars[i] = bar;
-    }
-}
-
-static void update_rssi_bars(int rssi)
-{
-    int lit = rssi_to_bars(rssi);
-    uint32_t lit_col = (lit >= 3) ? COL_OK :
-                       (lit >= 2) ? COL_WARN :
-                                    COL_BAD;
-    for (int i = 0; i < 4; i++) {
-        lv_obj_set_style_bg_color(s_rssi_bars[i],
-            lv_color_hex(i < lit ? lit_col : COL_OFF), 0);
-    }
-}
-
-/* Add one "Key: value" row at (x, y) and store the value-label pointer
- * so the periodic timer can update it. The key label uses dim text;
- * the value uses bright. */
-static void add_kv_row(lv_obj_t *parent, int x, int y,
-                       const char *key, lv_obj_t **value_out)
-{
-    lv_obj_t *k = lv_label_create(parent);
-    lv_label_set_text(k, key);
-    lv_obj_set_style_text_color(k, lv_color_hex(COL_TEXT_DIM), 0);
-    lv_obj_set_style_text_font(k, &lv_font_montserrat_14, 0);
-    lv_obj_set_pos(k, x, y);
-
-    lv_obj_t *v = lv_label_create(parent);
-    lv_label_set_text(v, "—");
-    lv_obj_set_style_text_color(v, lv_color_hex(COL_TEXT), 0);
-    lv_obj_set_style_text_font(v, &lv_font_montserrat_14, 0);
-    lv_obj_set_pos(v, x + 56, y);
-    *value_out = v;
-}
-
-/* ── Periodic refresh — 1 Hz LVGL timer ─────────────────────────────── */
-static void status_refresh_cb(lv_timer_t *t)
-{
-    (void)t;
-    char buf[40];
-
-    /* Wi-Fi block */
-    const char *state_str;
-    switch (network_get_state()) {
-    case NETWORK_STATE_CONNECTED:    state_str = "CONNECTED";    break;
-    case NETWORK_STATE_CONNECTING:   state_str = "CONNECTING…";  break;
-    case NETWORK_STATE_DISCONNECTED: state_str = "DISCONNECTED"; break;
-    default:                         state_str = "IDLE";         break;
-    }
-    lv_label_set_text(s_lbl_wifi_state, state_str);
-
-    network_get_ssid(buf, sizeof(buf));
-    lv_label_set_text(s_lbl_ssid, buf[0] ? buf : "—");
-
-    network_get_ip(buf, sizeof(buf));
-    lv_label_set_text(s_lbl_ip, buf[0] ? buf : "—");
-
-    int rssi = network_get_rssi();
-    if (rssi != 0) {
-        lv_label_set_text_fmt(s_lbl_rssi, "%d dBm  %s",
-                              rssi, rssi_quality_label(rssi));
-    } else {
-        lv_label_set_text(s_lbl_rssi, "—");
-    }
-    update_rssi_bars(rssi);
-
-    network_get_mac(buf, sizeof(buf));
-    lv_label_set_text(s_lbl_mac, buf[0] ? buf : "—");
-
-    /* TCP block */
-    bool has = cmd_link_has_client();
-    lv_label_set_text(s_lbl_tcp_state, has ? "bridge.py connected" : "no client");
-    lv_obj_set_style_text_color(s_lbl_tcp_state,
-        lv_color_hex(has ? COL_OK : COL_BAD), 0);
-
-    cmd_link_get_peer(buf, sizeof(buf));
-    lv_label_set_text(s_lbl_peer, buf[0] ? buf : "—");
-
-    int64_t last_us = cmd_link_last_send_us();
-    if (last_us > 0) {
-        int sec_ago = (int)((esp_timer_get_time() - last_us) / 1000000);
-        char cmd_buf[24];
-        cmd_link_get_last_cmd(cmd_buf, sizeof(cmd_buf));
-        lv_label_set_text_fmt(s_lbl_last_cmd, "%s   %ds ago",
-                              cmd_buf, sec_ago);
-    } else {
-        lv_label_set_text(s_lbl_last_cmd, "—");
-    }
-}
-
-/* ── Status tab — Wi-Fi / TCP diagnostics ───────────────────────────── */
-static void build_status_tab(lv_obj_t *tab)
+/* ── Rail tab — connectivity + displacement-from-origin readout ──────
+ * The rail is the Y axis. This tab shows whether the host bridge / rail
+ * link is alive and how far the rail has moved from the origin (Home /
+ * power-on = 0 mm). Both labels are updated from the serial RX task via
+ * ui_rail_set_status(). */
+static void build_rail_tab(lv_obj_t *tab)
 {
     lv_obj_set_style_pad_all(tab, 8, 0);
     lv_obj_set_style_bg_color(tab, lv_color_hex(COL_BG), 0);
     lv_obj_set_style_bg_opa(tab, LV_OPA_COVER, 0);
     lv_obj_clear_flag(tab, LV_OBJ_FLAG_SCROLLABLE);
 
-    const int row_h = 19;
-    int y = 0;
+    lv_obj_t *title = lv_label_create(tab);
+    lv_label_set_text(title, "Linear Rail (Y)");
+    lv_obj_set_style_text_color(title, lv_color_hex(COL_TEXT_DIM), 0);
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 0, 8);
 
-    add_kv_row(tab, 0, y, "Wi-Fi", &s_lbl_wifi_state);  y += row_h;
-    add_kv_row(tab, 0, y, "SSID",  &s_lbl_ssid);        y += row_h;
-    add_kv_row(tab, 0, y, "IP",    &s_lbl_ip);          y += row_h;
-    add_kv_row(tab, 0, y, "RSSI",  &s_lbl_rssi);
-    /* baseline_y is the bottom of the tallest bar so they sit on
-     * the text baseline of the RSSI row. */
-    build_rssi_bars(tab, 230, y + 17);                   y += row_h;
-    add_kv_row(tab, 0, y, "MAC",   &s_lbl_mac);          y += row_h + 4;
+    /* Connectivity: green "Connected" / red "Disconnected". Starts
+     * disconnected until the first STAT frame arrives. */
+    s_lbl_conn = lv_label_create(tab);
+    lv_label_set_text(s_lbl_conn, "Disconnected");
+    lv_obj_set_style_text_color(s_lbl_conn, lv_color_hex(COL_BAD), 0);
+    lv_obj_set_style_text_font(s_lbl_conn, &lv_font_montserrat_18, 0);
+    lv_obj_align(s_lbl_conn, LV_ALIGN_CENTER, 0, -18);
 
-    /* Thin separator between Wi-Fi and TCP groups. */
-    lv_obj_t *sep = lv_obj_create(tab);
-    lv_obj_remove_style_all(sep);
-    lv_obj_set_size(sep, SCR_W - 24, 1);
-    lv_obj_set_pos(sep, 0, y);
-    lv_obj_set_style_bg_color(sep, lv_color_hex(0x3D3D3D), 0);
-    lv_obj_set_style_bg_opa(sep, LV_OPA_COVER, 0);
-    y += 6;
+    lv_obj_t *disp_cap = lv_label_create(tab);
+    lv_label_set_text(disp_cap, "From origin");
+    lv_obj_set_style_text_color(disp_cap, lv_color_hex(COL_TEXT_DIM), 0);
+    lv_obj_set_style_text_font(disp_cap, &lv_font_montserrat_14, 0);
+    lv_obj_align(disp_cap, LV_ALIGN_CENTER, 0, 16);
 
-    add_kv_row(tab, 0, y, "TCP",   &s_lbl_tcp_state);   y += row_h;
-    add_kv_row(tab, 0, y, "Peer",  &s_lbl_peer);        y += row_h;
-    add_kv_row(tab, 0, y, "Last",  &s_lbl_last_cmd);
-
-    /* Kick off the 1 Hz refresh — owned by LVGL, runs on its task. */
-    lv_timer_create(status_refresh_cb, 1000, NULL);
-    /* Populate immediately so the first frame is not all em-dashes. */
-    status_refresh_cb(NULL);
+    s_lbl_disp = lv_label_create(tab);
+    lv_label_set_text(s_lbl_disp, "— mm");
+    lv_obj_set_style_text_color(s_lbl_disp, lv_color_hex(COL_Y), 0);
+    lv_obj_set_style_text_font(s_lbl_disp, &lv_font_montserrat_18, 0);
+    lv_obj_align(s_lbl_disp, LV_ALIGN_CENTER, 0, 40);
 }
 
 /* ── Move tab — 2D drag-to-target picker ────────────────────────────── */
@@ -776,20 +676,38 @@ void ui_create(void)
      * itself so the snap behavior is preserved when buttons are tapped. */
     lv_obj_clear_flag(lv_tabview_get_content(tv), LV_OBJ_FLAG_SCROLLABLE);
 
-    /* Tab order: Move Control (left) | Jog Control (middle) | Status (right). */
+    /* Tab order: Move Control (left) | Jog Control (middle) | Rail (right). */
     lv_obj_t *tab_move = lv_tabview_add_tab(tv, "Move Control");
     lv_obj_t *tab_ctrl = lv_tabview_add_tab(tv, "Jog Control");
-    lv_obj_t *tab_stat = lv_tabview_add_tab(tv, "Status");
+    lv_obj_t *tab_rail = lv_tabview_add_tab(tv, "Rail");
 
     build_move_tab(tab_move);
     build_control_tab(tab_ctrl);
-    build_status_tab(tab_stat);
+    build_rail_tab(tab_rail);
 
     /* Drive both control tabs' position readouts at 2 Hz (matches the
      * bridge's ~500 ms POS push). */
     lv_timer_create(pos_refresh_cb, 500, NULL);
 
     /* Default landing tab — keep Jog Control front since that's the
-     * primary controller; user can swipe-by-tab to Move/Status. */
+     * primary controller; user can swipe-by-tab to Move/Rail. */
     lv_tabview_set_active(tv, 1, LV_ANIM_OFF);
+}
+
+/* Update the Rail tab from the serial RX task (takes the display lock
+ * internally). The rail is the Y axis and the origin is Home (0 mm), so
+ * the reported position is the displacement from origin. */
+void ui_rail_set_status(bool connected, float mm)
+{
+    UI_WITH_LOCK({
+        if (s_lbl_conn) {
+            lv_label_set_text(s_lbl_conn,
+                              connected ? "Connected" : "Disconnected");
+            lv_obj_set_style_text_color(s_lbl_conn,
+                lv_color_hex(connected ? COL_OK : COL_BAD), 0);
+        }
+        if (s_lbl_disp) {
+            lv_label_set_text_fmt(s_lbl_disp, "%.1f mm", mm);
+        }
+    });
 }
