@@ -72,6 +72,12 @@ HOME_DIR_X = 0x01
 
 # How long to wait between reconnect attempts when the ESP32 link drops.
 RECONNECT_DELAY_S = 2.0
+
+# Position feedback: how often to read X/Z encoders and push a
+# "POS:X <mm> Z <mm>" line back to the ESP32 UI. Each read holds the
+# motor lock briefly (~0.1 s), so this also gates how much it competes
+# with jog/move commands — raise it if jog feels laggy.
+POS_POLL_INTERVAL_S = 0.5
 # ─────────────────────────────────────────────────────────────────────────
 
 
@@ -83,6 +89,10 @@ RECONNECT_DELAY_S = 2.0
 _motor_lock = threading.Lock()
 _z_motors: list = []
 _x_motor: MKSMotor | None = None
+
+# Current TCP socket to the ESP32, or None while the link is down. Set by
+# main()'s connect loop; read by the position-poll thread to push updates.
+_esp32_sock: socket.socket | None = None
 
 
 # ─── Fatal-fault handler ─────────────────────────────────────────────────
@@ -315,11 +325,49 @@ def connect_esp32():
             time.sleep(RECONNECT_DELAY_S)
 
 
+# ─── Position feedback (PC → ESP32 UI) ───────────────────────────────────
+
+def _read_axis_mm(motor):
+    """Best-effort single-motor position read in mm; None on any error.
+
+    Holds the motor lock only for the one read so it interleaves with
+    jog/move commands. Swallows every error — position feedback must
+    never abort the bridge; that is solely the motion path's job.
+    """
+    try:
+        with _motor_lock:
+            return motor.read_position_mm()
+    except Exception:
+        return None
+
+
+def position_poll_loop():
+    """Daemon loop: read X/Z encoders and push them to the ESP32 UI.
+
+    Sends one "POS:X <mm> Z <mm>" line per cycle over the same TCP link
+    the CMD: lines ride on. Skips a cycle whenever the link is down or a
+    read fails. Z uses one motor of the pair (both track together).
+    """
+    while True:
+        time.sleep(POS_POLL_INTERVAL_S)
+        sock = _esp32_sock
+        if sock is None or not _z_motors or _x_motor is None:
+            continue
+        x_mm = _read_axis_mm(_x_motor)
+        z_mm = _read_axis_mm(_z_motors[0])
+        if x_mm is None or z_mm is None:
+            continue
+        try:
+            sock.sendall(f"POS:X {x_mm:.1f} Z {z_mm:.1f}\n".encode("ascii"))
+        except OSError:
+            pass  # link dropped mid-send; main loop will reconnect
+
+
 # ─── Entry point ─────────────────────────────────────────────────────────
 
 def main():
     """Initialize motors, start the HTTP server, then run the TCP loop."""
-    global _z_motors, _x_motor
+    global _z_motors, _x_motor, _esp32_sock
 
     print("Refreshing USB device nodes (FTDI)...")
     prepare_usb_nodes()
@@ -366,10 +414,15 @@ def main():
     print(f"HTTP API listening on http://0.0.0.0:{HTTP_PORT}  "
           f"(Swagger UI at /docs)")
 
+    # Stream X/Z position back to the ESP32 UI in the background.
+    pos_thread = threading.Thread(target=position_poll_loop, daemon=True)
+    pos_thread.start()
+
     try:
         while True:
             print(f"Connecting to ESP32 at {ESP32_IP}:{ESP32_PORT}...")
             sock = connect_esp32()
+            _esp32_sock = sock  # let the poll thread push POS: updates
             print("Bridge ready. Touch the display to jog.\n")
 
             # makefile gives us readline() that handles partial-frame
@@ -387,6 +440,7 @@ def main():
             except OSError as e:
                 print(f"[ESP32] socket error: {e}")
             finally:
+                _esp32_sock = None
                 stream.close()
                 sock.close()
             print("[ESP32] disconnected, reconnecting...")

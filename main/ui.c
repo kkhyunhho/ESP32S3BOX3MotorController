@@ -67,10 +67,11 @@ static lv_obj_t *s_lbl_disp;
 
 /* ── Move-tab geometry ──────────────────────────────────────────────── */
 /* The plot lives in the LEFT pane of the tab (mirrors Jog Control's
- * dial-on-left / placeholder-on-right split). Sized 160 × 160 so it
- * comfortably fits with X/Z readouts and the Move button below. The
- * 20 mm × 20 mm grid lines snap nicely to 8-pixel steps. */
-#define PLOT_SIZE       160
+ * dial-on-left / placeholder-on-right split). Sized 140 × 140 so it
+ * fits with the X/Z readouts, the Move button, AND the current-position
+ * line pinned to the bottom. 140 is a multiple of 20 mm so the grid
+ * lines still snap to whole pixels (7 px per 20 mm step). */
+#define PLOT_SIZE       140
 #define PLOT_X_OFFSET   25    /* centres the plot in the left 210 px pane */
 #define PLOT_Y_OFFSET   4
 #define MARKER_R        6     /* radius of the cross-hair centre dot     */
@@ -91,6 +92,12 @@ static lv_obj_t *s_lbl_target_x;
 static lv_obj_t *s_lbl_target_z;
 static int s_target_x_mm = 0;
 static int s_target_z_mm = 0;
+
+/* ── Current-position readout (one per control tab) ──────────────────── */
+/* Both pinned to the tab bottom, refreshed from the PC's "POS:..."
+ * feedback by pos_refresh_cb. */
+static lv_obj_t *s_lbl_pos_move;
+static lv_obj_t *s_lbl_pos_jog;
 
 /* ── Draw one filled arc sector (angles: 0=3 o'clock, CW, degrees) ──── */
 static void draw_sector(lv_layer_t *layer,
@@ -326,6 +333,19 @@ static lv_obj_t *make_y_btn(lv_obj_t *parent,
 
 /* ── Jog tab — X/Z dial (reserved for the future ball-screw) plus the
  *    Y jog buttons that drive the rail. ─────────────────────────────── */
+/* One-line current-position readout pinned to the bottom-left of a
+ * control tab. Auto-sized (no fixed width) so it always stays one line;
+ * the values come from pos_refresh_cb. */
+static lv_obj_t *make_pos_label(lv_obj_t *parent)
+{
+    lv_obj_t *lbl = lv_label_create(parent);
+    lv_obj_set_pos(lbl, 6, CONTENT_H - 16);
+    lv_obj_set_style_text_color(lbl, lv_color_hex(COL_TEXT), 0);
+    lv_obj_set_style_text_font(lbl, &lv_font_montserrat_14, 0);
+    lv_label_set_text(lbl, "Pos  --");
+    return lbl;
+}
+
 static void build_control_tab(lv_obj_t *tab)
 {
     lv_obj_set_style_pad_all(tab, 0, 0);
@@ -346,6 +366,8 @@ static void build_control_tab(lv_obj_t *tab)
                "Y " LV_SYMBOL_UP, DIR_POS);
     make_y_btn(tab, RIGHT_X, CONTENT_H / 2 + 2, RIGHT_W, Y_BTN_H,
                "Y " LV_SYMBOL_DOWN, DIR_NEG);
+
+    s_lbl_pos_jog = make_pos_label(tab);
 }
 
 /* ── Rail tab — connectivity + displacement-from-origin readout ──────
@@ -607,7 +629,33 @@ static void build_move_tab(lv_obj_t *tab)
     lv_obj_set_style_text_font(linear_lbl, &lv_font_montserrat_18, 0);
     lv_obj_center(linear_lbl);
 
+    s_lbl_pos_move = make_pos_label(tab);
+
     refresh_move_widgets();
+}
+
+/* Refresh both control tabs' current-position lines from the latest
+ * "POS:X <mm> Z <mm>" the PC pushed. "Pos  --" until the first update
+ * (or after the link drops, which clears the stored value). */
+static void pos_refresh_cb(lv_timer_t *t)
+{
+    (void)t;
+    char pos[32];
+    cmd_link_get_position(pos, sizeof(pos));
+
+    char buf[40];
+    if (pos[0] == '\0') {
+        snprintf(buf, sizeof(buf), "Pos  --");
+    } else {
+        snprintf(buf, sizeof(buf), "Pos  %s mm", pos);
+    }
+
+    if (s_lbl_pos_move != NULL) {
+        lv_label_set_text(s_lbl_pos_move, buf);
+    }
+    if (s_lbl_pos_jog != NULL) {
+        lv_label_set_text(s_lbl_pos_jog, buf);
+    }
 }
 
 /* ── Public: build the full UI ──────────────────────────────────────── */
@@ -636,6 +684,10 @@ void ui_create(void)
     build_move_tab(tab_move);
     build_control_tab(tab_ctrl);
     build_rail_tab(tab_rail);
+
+    /* Drive both control tabs' position readouts at 2 Hz (matches the
+     * bridge's ~500 ms POS push). */
+    lv_timer_create(pos_refresh_cb, 500, NULL);
 
     /* Default landing tab — keep Jog Control front since that's the
      * primary controller; user can swipe-by-tab to Move/Rail. */
